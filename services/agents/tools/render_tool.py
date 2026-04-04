@@ -11,21 +11,17 @@ def _get_auth_token(audience: str) -> str:
     return google.oauth2.id_token.fetch_id_token(auth_req, audience)
 
 
-def render_manim_video(
-    python_code: str,
-    scene_class_name: str = "GeneratedScene",
-    quality: str = "l"
-) -> dict:
-    """Sends Manim code to the renderer service, returns video URL.
+def render_manim_video(python_code: str) -> dict:
+    """Sends Manim code to the renderer service and returns the video URL.
 
     Args:
-        python_code: Complete Manim Python script.
-        scene_class_name: Name of the Scene class.
-        quality: 'l' for 480p, 'm' for 720p, 'h' for 1080p.
+        python_code: Complete Manim Python script with a class named GeneratedScene.
 
     Returns:
         dict with status and video_url or error.
     """
+    scene_class_name = "GeneratedScene"
+    quality = "l"
     try:
         headers = {}
         if RENDER_URL and "run.app" in RENDER_URL:

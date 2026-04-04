@@ -40,7 +40,7 @@ async def render_video(req: RenderRequest):
             return {"status": "error", "error": "No .mp4 produced"}
 
         # Upload to GCS
-        client = storage.Client()
+        client = storage.Client(project=os.getenv("GOOGLE_CLOUD_PROJECT"))
         blob = client.bucket(GCS_BUCKET).blob(f"videos/{rid}_{req.scene_class_name}.mp4")
         blob.upload_from_filename(os.path.join(vdir, vfiles[0]), content_type="video/mp4")
         blob.make_public()

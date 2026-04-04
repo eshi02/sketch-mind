@@ -3,8 +3,9 @@ ENV DEBIAN_FRONTEND=noninteractive
 ENV PYTHONUNBUFFERED=1
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
+    gcc g++ python3-dev \
     ffmpeg libcairo2-dev libpango1.0-dev pkg-config \
-    texlive-base texlive-latex-base texlive-fonts-recommended \
+    texlive-latex-extra texlive-fonts-recommended dvisvgm \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app

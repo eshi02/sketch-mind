@@ -1,0 +1,77 @@
+services:
+  db:
+    image: pgvector/pgvector:pg16
+    environment:
+      POSTGRES_DB: sketchmind
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: localpass
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 5s
+      retries: 5
+
+  renderer:
+    build: ./services/renderer
+    ports:
+      - "8082:8080"
+    environment:
+      GCS_BUCKET: ${GCS_BUCKET}
+      GOOGLE_CLOUD_PROJECT: ${GOOGLE_CLOUD_PROJECT}
+      GOOGLE_APPLICATION_CREDENTIALS: /gcp/creds.json
+    volumes:
+      - ${GOOGLE_APPLICATION_CREDENTIALS:-~/.config/gcloud/application_default_credentials.json}:/gcp/creds.json:ro
+
+  agents:
+    build: ./services/agents
+    ports:
+      - "8081:8080"
+    environment:
+      RENDER_SERVICE_URL: http://renderer:8080
+      GOOGLE_CLOUD_PROJECT: ${GOOGLE_CLOUD_PROJECT}
+      GOOGLE_CLOUD_LOCATION: ${GCP_LOCATION:-asia-south1}
+      GOOGLE_GENAI_USE_VERTEXAI: "True"
+      GOOGLE_APPLICATION_CREDENTIALS: /gcp/creds.json
+    volumes:
+      - ${GOOGLE_APPLICATION_CREDENTIALS:-~/.config/gcloud/application_default_credentials.json}:/gcp/creds.json:ro
+    depends_on:
+      - renderer
+
+  api:
+    build: ./services/api
+    ports:
+      - "8080:8080"
+    environment:
+      AGENTS_SERVICE_URL: http://agents:8080
+      GCP_PROJECT_ID: ${GOOGLE_CLOUD_PROJECT}
+      ALLOYDB_HOST: db
+      ALLOYDB_PORT: "5432"
+      ALLOYDB_DB: sketchmind
+      ALLOYDB_USER: postgres
+      ALLOYDB_PASS: localpass
+      GOOGLE_APPLICATION_CREDENTIALS: /gcp/creds.json
+    volumes:
+      - ${GOOGLE_APPLICATION_CREDENTIALS:-~/.config/gcloud/application_default_credentials.json}:/gcp/creds.json:ro
+    depends_on:
+      db:
+        condition: service_healthy
+      agents:
+        condition: service_started
+
+  web:
+    build:
+      context: ./services/web
+      args:
+        NEXT_PUBLIC_API_URL: http://localhost:8080
+    ports:
+      - "3000:3000"
+    environment:
+      NEXT_PUBLIC_API_URL: http://localhost:8080
+    depends_on:
+      - api
+
+volumes:
+  pgdata:
