@@ -30,4 +30,4 @@ media/
 *.json
 !package.json
 !tsconfig.json
-!api.json
+!manim_api.json
