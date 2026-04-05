@@ -11,11 +11,12 @@ def _get_auth_token(audience: str) -> str:
     return google.oauth2.id_token.fetch_id_token(auth_req, audience)
 
 
-def render_manim_video(python_code: str) -> dict:
+def render_manim_video(python_code: str, audio_script: str = "") -> dict:
     """Sends Manim code to the renderer service and returns the video URL.
 
     Args:
         python_code: Complete Manim Python script with a class named GeneratedScene.
+        audio_script: Full narration text to synthesize as voiceover audio.
 
     Returns:
         dict with status and video_url or error.
@@ -28,11 +29,15 @@ def render_manim_video(python_code: str) -> dict:
             token = _get_auth_token(RENDER_URL)
             headers["Authorization"] = f"Bearer {token}"
 
+        body = {"python_code": python_code,
+                "scene_class_name": scene_class_name,
+                "quality": quality}
+        if audio_script:
+            body["audio_script"] = audio_script
+
         resp = httpx.post(
             f"{RENDER_URL}/render",
-            json={"python_code": python_code,
-                  "scene_class_name": scene_class_name,
-                  "quality": quality},
+            json=body,
             headers=headers,
             timeout=300,
         )

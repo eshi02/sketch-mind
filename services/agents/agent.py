@@ -52,24 +52,53 @@ async def create_agents():
         name="scriptwriter",
         model="gemini-2.5-flash",
         description="Creates a precise, continuous Manim storyboard script from a subtopic brief.",
-        instruction="""You are a technical video scriptwriter and director.
-    Translate the provided single-concept research brief into a strict, continuous storyboard.
+        instruction="""You are a technical video scriptwriter and director for animated educational videos.
+    Translate the provided research brief into a visual-first storyboard.
 
     Research Brief: {SUBTOPIC_DATA?}
 
     Output ONLY a single JSON object representing the entire 60-90 second video.
-    RULES:
-    1. Do NOT break the video into separate scenes. It must be one continuous flow.
-    2. The `continuous_visual_directive` MUST dictate exact geometry and timing chronologically (e.g., "Step 1: ..., Step 2: ..., Step 3: ...").
-    3. Use specific verbs: "Create", "Write", "Transform", "FadeIn".
-    4. Specify locations: "top edge", "center", "next to".
-    5. Specify object types: Use "MathTex" for equations, "Text" for words, "Axes" for graphs.
+
+    CRITICAL DESIGN PRINCIPLES:
+    1. **ANIMATION-FIRST:** The video must be driven by moving shapes, graphs, arrows, transforms,
+       and geometric objects — NOT walls of text. Text should only be short labels (1-5 words),
+       titles, or key terms. NEVER display full sentences as on-screen text.
+    2. **SHOW, DON'T TELL:** If explaining gravity, animate a ball falling — don't write "gravity
+       pulls objects down" on screen. The audio script carries the explanation; the visuals illustrate it.
+    3. **MINIMAL ON-SCREEN TEXT:** Maximum 5 words per text element. Use at most 3 text elements
+       visible at any time. Prefer MathTex for formulas and short Text labels for key terms.
+    4. **SAFE LAYOUT:** All elements must stay within the visible frame. Use coordinates within
+       x=[-6, 6] and y=[-3.5, 3.5]. Never place elements at extreme edges.
+    5. **CLEAN TRANSITIONS:** FadeOut ALL previous elements before introducing new ones.
+       Never let elements pile up or overlap. Each visual section starts on a clean canvas.
+    6. **KEEP VISUALS SIMPLE:** Use only basic shapes: circles, rectangles, arrows, lines, dots, axes.
+       Do NOT describe complex structures like molecular diagrams, circuit boards, DNA helices, or
+       detailed anatomical drawings. Instead, represent complex concepts using SIMPLE metaphors
+       with basic geometric shapes. For example: represent atoms as colored circles, bonds as lines,
+       data flow as arrows between boxes.
+    7. **MAX 5 ELEMENTS:** Never have more than 5 visible elements on screen simultaneously.
+
+    VISUAL DIRECTIVE RULES:
+    1. One continuous flow — no separate scenes.
+    2. Chronological steps: "Step 1: ..., Step 2: ..., Step 3: ...".
+    3. Use specific verbs: "Create", "Write", "Transform", "FadeIn", "FadeOut", "MoveAlongPath", "Indicate".
+    4. Specify exact positions: "at UP*2+LEFT*3", "at center", "at DOWN*1.5".
+    5. Specify object types: MathTex, Text (short labels only), Axes, Circle, Arrow, Line, Rectangle.
+    6. Emphasize animated transitions: objects morphing, growing, moving, being highlighted.
+    7. Each step MUST include FadeOut of previous elements if the area will be reused.
+
+    AUDIO SCRIPT RULES:
+    1. Write the full_audio_script as natural spoken narration — as if a teacher is explaining.
+    2. Do NOT include any special characters, markdown, asterisks, bullet points, or formatting.
+    3. Write plain conversational English only. No parentheses, no slashes, no technical markup.
+    4. Example GOOD: "Lets start with the Pythagorean theorem. It tells us that in a right triangle, the square of the longest side equals the sum of the squares of the other two sides."
+    5. Example BAD: "The *Pythagorean* theorem states: a² + b² = c² (where c = hypotenuse)."
 
     JSON SCHEMA:
     {
       "concept_title": "The title of the concept",
-      "full_audio_script": "The complete spoken words for the voiceover...",
-      "continuous_visual_directive": "Step 1: Write Text 'Title' at the top edge. Wait 1 sec. Step 2: Create a set of Axes in the center...",
+      "full_audio_script": "Natural spoken narration without any special characters or formatting...",
+      "continuous_visual_directive": "Step 1: Write short Text 'Title' at UP*3. Wait 1 sec. Step 2: Create Circle at center. Step 3: FadeOut Text. Create Axes at center...",
       "estimated_duration_seconds": 85
     }
 
@@ -99,12 +128,48 @@ async def create_agents():
     1.  **API Version:** ONLY use ManimCE v0.20.1 syntax. Verify with lookup tools.
     2.  **Creation:** Use `Create()` for shapes, `Write()` for text/math, `FadeIn()` for groups. NEVER use `ShowCreation()`.
     3.  **Color:** Pass `color=...` in the constructor (e.g., `Text("Hello", color=BLUE)`).
-    4.  **Positioning:** Elements MUST NOT overlap. Use `next_to()`, `shift()`, `to_edge()`, or `move_to()`.
-    5.  **Graphs:** Use `axes.plot(func)` — verify with `lookup_manim_class("Axes")`.
-    6.  **Grouping:** Use `VGroup` for VMobjects of the same type, `Group` for mixed types.
-    7.  **Text vs Math:** Use `MathTex` for equations, `Text` for plain text.
-    8.  **Pacing:** `self.wait(1)` after major animation blocks, `self.wait(2)` at scene end.
-    9.  **No images or SVGs:** Do NOT use ImageMobject or SVGMobject.
+    4.  **SAFE FRAME BOUNDS:** The visible frame is x=[-7, 7], y=[-4, 4]. Keep ALL elements within
+        x=[-6, 6] and y=[-3.5, 3.5] to prevent clipping. Use `.scale()` to shrink elements if needed.
+    5.  **MANDATORY SCENE CLEARING:** Before EVERY new visual section, call
+        `self.play(FadeOut(*self.mobjects))` to clear the entire scene. This is NON-NEGOTIABLE.
+        Never accumulate elements from previous sections. Each section starts with a clean canvas.
+    6.  **NO OVERLAPPING — EVER:** Never place two elements at the same position. Mentally track
+        every element's position. Use `next_to()`, `shift()`, or explicit coordinates with sufficient spacing.
+        If in doubt, clear the scene first with `self.play(FadeOut(*self.mobjects))`.
+    7.  **KEEP IT SIMPLE:** Use only basic Manim primitives: Circle, Square, Rectangle, Arrow, Line,
+        Dot, Text, MathTex, Axes, NumberLine, VGroup. Do NOT attempt complex structures like
+        molecular diagrams, circuit boards, neural networks, or anything requiring precise multi-element layouts
+        with many overlapping parts. Represent complex concepts with SIMPLE analogies using basic shapes.
+    8.  **SHORT TEXT ONLY:** Text objects must be 1-5 words max. NEVER put full sentences on screen.
+        Use `font_size=36` or smaller for labels. Use `font_size=48` only for titles.
+    9.  **MAX 5 ELEMENTS ON SCREEN:** At any point, no more than 5 visible elements on screen.
+        If you need more, FadeOut older ones first.
+    10. **ANIMATION-HEAVY:** Prefer animated objects (shapes, arrows, graphs, transforms) over text.
+        At least 70% of the scene time should be geometric animations, not text appearing.
+    11. **Graphs:** Use `axes.plot(func)` — verify with `lookup_manim_class("Axes")`.
+    12. **Grouping:** Use `VGroup` for VMobjects of the same type, `Group` for mixed types.
+    13. **Pacing:** `self.wait(1)` after major animation blocks, `self.wait(2)` at scene end.
+    14. **No images or SVGs:** Do NOT use ImageMobject or SVGMobject.
+
+    ANTI-PATTERN EXAMPLES (NEVER do these):
+    - Placing 10+ Text/MathTex labels around a shape (causes overlap mess)
+    - Building molecule/atom diagrams with individual letter labels (too complex for Manim)
+    - Adding elements without clearing previous ones (causes pile-up)
+    - Using coordinates without checking if another element is already there
+
+    CORRECT PATTERN:
+    ```
+    # Section 1
+    title = Text("Topic", font_size=48).to_edge(UP)
+    self.play(Write(title))
+    shape = Circle(radius=1.5, color=BLUE).move_to(ORIGIN)
+    self.play(Create(shape))
+    self.wait(1)
+    # Clear before section 2
+    self.play(FadeOut(*self.mobjects))
+    # Section 2 — clean canvas
+    ...
+    ```
 
     Output ONLY raw Python code. No markdown blocks, no backticks, no explanation.
     The class MUST be named `GeneratedScene`.
@@ -138,8 +203,15 @@ async def create_agents():
     2.  **Type Safety:** Are `VGroup`s only containing VMobjects? (If mixed, use `Group`).
     3.  **Deprecated Methods:** No `ShowCreation` (use `Create`). No `get_graph` (use `plot`).
     4.  **Positioning:** Ensure no objects overlap. Use `next_to`, `shift`, `to_edge`.
+        All elements must stay within x=[-6, 6] and y=[-3.5, 3.5]. Use `.scale()` if elements are too large.
     5.  **No ImageMobject or SVGMobject.**
     6.  **Mental Dry-Run:** Step through the animation mentally. Ensure pacing and no off-screen objects.
+    7.  **MANDATORY SCENE CLEARING:** Between visual sections, use `self.play(FadeOut(*self.mobjects))`
+        to clear the canvas. Never accumulate elements from previous sections.
+    8.  **Text Size:** Text elements should use font_size=36 or smaller. Max 5 words per text element.
+    9.  **MAX 5 ELEMENTS:** No more than 5 visible elements on screen at any time.
+    10. **SIMPLIFY:** If the code tries to build complex multi-element structures (molecule diagrams,
+        circuit boards, etc.) that cause overlap, replace them with simple shapes and labels.
 
     Output ONLY the FULL, corrected raw Python code. No markdown blocks, no backticks, no explanation.
     The class MUST remain named `GeneratedScene`.
@@ -153,12 +225,16 @@ async def create_agents():
         name="renderer",
         model="gemini-2.5-flash",
         description="Renders Manim code into video.",
-        instruction="""Call render_manim_video ONCE with this code: {MANIM_CODE?}
+        instruction="""Call render_manim_video with the Manim code and the audio narration script.
+
+    Code: {MANIM_CODE?}
+    Script JSON: {SCRIPT_JSON?}
 
     IMPORTANT RULES:
-    1. Call render_manim_video exactly ONCE. Never call it more than once.
-    2. If the result status is 'success', call exit_loop tool immediately.
-    3. If the result status is 'error', just output the error message as plain text.
+    1. Parse the Script JSON above to extract the "full_audio_script" field.
+    2. Call render_manim_video exactly ONCE with both python_code and audio_script parameters.
+    3. If the result status is 'success', call exit_loop tool immediately.
+    4. If the result status is 'error', just output the error message as plain text.
        Do NOT call render_manim_video again. Do NOT call exit_loop.
        Just output the error so the fixer can fix it in the next iteration.""",
         tools=[render_manim_video, exit_loop],
