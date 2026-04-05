@@ -4,3 +4,4 @@ google-adk==1.14.0
 google-cloud-aiplatform
 google-auth
 httpx
+mcp>=1.0.0

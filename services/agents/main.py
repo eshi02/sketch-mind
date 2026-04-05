@@ -1,17 +1,39 @@
 """Agent service: research endpoint + streaming subtopic endpoint."""
 import json, re, logging
+from google.adk.tools.mcp_tool import McpToolset
 from fastapi import FastAPI
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 from google.adk.runners import Runner
 from google.adk.sessions import InMemorySessionService
 from google.genai import types
-from agent import researcher, subtopic_pipeline
+from agent import create_agents
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("sketchmind-agents")
 
 app = FastAPI(title="SketchMind Agents")
+
+# Agent instances — initialized async on startup
+_researcher = None
+_subtopic_pipeline = None
+_mcp_toolset: McpToolset | None = None
+
+
+@app.on_event("startup")
+async def startup():
+    global _researcher, _subtopic_pipeline, _mcp_toolset
+    logger.info("Initializing agents and MCP toolsets...")
+    _researcher, _subtopic_pipeline, _mcp_toolset = await create_agents()
+    logger.info("Agents initialized successfully with Manim MCP tools.")
+
+
+@app.on_event("shutdown")
+async def shutdown():
+    global _mcp_toolset
+    if _mcp_toolset:
+        logger.info("Closing MCP server connections...")
+        await _mcp_toolset.close()
 
 # Map ADK agent names to user-friendly stage descriptions
 AGENT_STAGES = {
@@ -44,7 +66,7 @@ async def research(req: ResearchRequest):
     """Run the researcher agent and return parsed subtopics."""
     session_service = InMemorySessionService()
     runner = Runner(
-        agent=researcher, app_name="sketchmind", session_service=session_service
+        agent=_researcher, app_name="sketchmind", session_service=session_service
     )
     session = await session_service.create_session(
         app_name="sketchmind", user_id="user"
@@ -103,7 +125,7 @@ async def process_subtopic(req: SubtopicRequest):
         try:
             session_service = InMemorySessionService()
             runner = Runner(
-                agent=subtopic_pipeline,
+                agent=_subtopic_pipeline,
                 app_name="sketchmind",
                 session_service=session_service,
             )
