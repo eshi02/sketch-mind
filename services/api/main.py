@@ -6,8 +6,12 @@ from pydantic import BaseModel
 import httpx
 import google.auth.transport.requests
 import google.oauth2.id_token
-from database import init_db, check_semantic_cache, create_session
-from database import update_video_record, mark_failed, get_all_videos
+from database import (
+    init_db, check_semantic_cache, create_session,
+    create_subtopic_record, update_subtopic_record,
+    mark_subtopic_failed, complete_parent_session,
+    mark_failed, get_all_videos,
+)
 from embeddings import generate_embedding
 
 AGENTS_URL = os.getenv("AGENTS_SERVICE_URL")
@@ -36,10 +40,15 @@ class TopicRequest(BaseModel):
 @app.post("/api/generate")
 async def generate_video(req: TopicRequest):
     embedding = await generate_embedding(req.topic)
+
+    # Semantic cache check — now returns multiple videos
     cached = await check_semantic_cache(embedding)
     if cached:
-        return {"status": "cached", "video_url": cached["video_url"],
-                "topic": cached["topic"]}
+        return {
+            "status": "cached",
+            "videos": cached["videos"],
+            "topic": cached["topic"],
+        }
 
     video_id = await create_session(req.topic, embedding)
     sessions[video_id] = {"stage": "starting", "topic": req.topic}
@@ -78,13 +87,36 @@ async def run_pipeline(video_id: str, topic: str, embedding: list):
         )
         result = resp.json()
 
-        if result.get("video_url"):
-            await update_video_record(video_id, result["video_url"])
-            sessions[video_id] = {"stage": "completed",
-                                  "video_url": result["video_url"]}
+        videos = result.get("videos", [])
+
+        # Create child DB records for each subtopic
+        for v in videos:
+            child_id = await create_subtopic_record(
+                parent_id=video_id,
+                subtopic_title=v.get("subtopic_title", "Untitled"),
+                subtopic_index=v.get("index", 0),
+            )
+            if v.get("video_url"):
+                await update_subtopic_record(child_id, v["video_url"])
+            elif v.get("error"):
+                await mark_subtopic_failed(child_id, v["error"])
+            else:
+                await mark_subtopic_failed(child_id, "No video produced")
+
+        await complete_parent_session(video_id)
+
+        succeeded = [v for v in videos if v.get("video_url")]
+        if succeeded:
+            sessions[video_id] = {
+                "stage": "completed",
+                "videos": videos,
+            }
         else:
-            sessions[video_id] = {"stage": "completed",
-                                  "result": result.get("agent_response", "")}
+            sessions[video_id] = {
+                "stage": "failed",
+                "error": result.get("error", "All subtopic videos failed"),
+                "videos": videos,
+            }
 
     except Exception as e:
         await mark_failed(video_id, str(e))

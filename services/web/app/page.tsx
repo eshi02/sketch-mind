@@ -3,10 +3,17 @@ import { useState } from "react";
 
 const API_URL = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8080";
 
+interface VideoResult {
+  subtopic_title: string;
+  video_url: string | null;
+  index: number;
+  error?: string;
+}
+
 export default function Home() {
   const [topic, setTopic] = useState("");
   const [status, setStatus] = useState<string | null>(null);
-  const [videoUrl, setVideoUrl] = useState<string | null>(null);
+  const [videos, setVideos] = useState<VideoResult[] | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
 
@@ -14,7 +21,7 @@ export default function Home() {
     if (!topic.trim()) return;
     setLoading(true);
     setStatus("Submitting...");
-    setVideoUrl(null);
+    setVideos(null);
     setError(null);
 
     try {
@@ -26,8 +33,8 @@ export default function Home() {
       const data = await res.json();
 
       if (data.status === "cached") {
-        setVideoUrl(data.video_url);
-        setStatus("Found cached video!");
+        setVideos(data.videos);
+        setStatus("Found cached videos!");
         setLoading(false);
         return;
       }
@@ -53,11 +60,14 @@ export default function Home() {
       setStatus(state.stage);
 
       if (state.stage === "completed") {
-        setVideoUrl(state.video_url || null);
+        setVideos(state.videos || []);
         setLoading(false);
         ws.close();
       } else if (state.stage === "failed") {
         setError(state.error || "Generation failed");
+        if (state.videos?.length) {
+          setVideos(state.videos);
+        }
         setLoading(false);
         ws.close();
       }
@@ -69,11 +79,14 @@ export default function Home() {
     };
   }
 
+  const succeededVideos = videos?.filter((v) => v.video_url) || [];
+  const failedCount = videos ? videos.length - succeededVideos.length : 0;
+
   return (
-    <main style={{ maxWidth: 700, margin: "0 auto", padding: "4rem 1.5rem", textAlign: "center" }}>
+    <main style={{ maxWidth: 900, margin: "0 auto", padding: "4rem 1.5rem", textAlign: "center" }}>
       <h1 style={{ fontSize: "2.5rem", marginBottom: "0.5rem" }}>SketchMind</h1>
       <p style={{ color: "#888", marginBottom: "2rem" }}>
-        Enter any topic and get an AI-generated animated educational video.
+        Enter any topic and get AI-generated animated educational videos.
       </p>
 
       <div style={{ display: "flex", gap: "0.5rem", marginBottom: "2rem" }}>
@@ -112,22 +125,54 @@ export default function Home() {
         <p style={{ color: "#ef4444" }}>Error: {error}</p>
       )}
 
-      {videoUrl && (
-        <div style={{ marginTop: "1.5rem" }}>
-          <video
-            src={videoUrl}
-            controls
-            autoPlay
-            style={{ width: "100%", borderRadius: 12, background: "#000" }}
-          />
-          <a
-            href={videoUrl}
-            target="_blank"
-            rel="noopener noreferrer"
-            style={{ color: "#4f46e5", marginTop: "0.5rem", display: "inline-block" }}
-          >
-            Open video in new tab
-          </a>
+      {failedCount > 0 && succeededVideos.length > 0 && (
+        <p style={{ color: "#f59e0b", marginBottom: "1rem" }}>
+          {succeededVideos.length} of {videos!.length} videos generated successfully.
+        </p>
+      )}
+
+      {succeededVideos.length > 0 && (
+        <div
+          style={{
+            display: "grid",
+            gridTemplateColumns: succeededVideos.length === 1 ? "1fr" : "1fr 1fr",
+            gap: "1.5rem",
+            marginTop: "1.5rem",
+            textAlign: "left",
+          }}
+        >
+          {succeededVideos
+            .sort((a, b) => a.index - b.index)
+            .map((v) => (
+              <div
+                key={v.index}
+                style={{
+                  background: "#111",
+                  borderRadius: 12,
+                  overflow: "hidden",
+                  border: "1px solid #222",
+                }}
+              >
+                <video
+                  src={v.video_url!}
+                  controls
+                  style={{ width: "100%", display: "block" }}
+                />
+                <div style={{ padding: "0.75rem 1rem" }}>
+                  <h3 style={{ fontSize: "1rem", margin: 0, marginBottom: "0.25rem" }}>
+                    {v.subtopic_title}
+                  </h3>
+                  <a
+                    href={v.video_url!}
+                    target="_blank"
+                    rel="noopener noreferrer"
+                    style={{ color: "#4f46e5", fontSize: "0.85rem" }}
+                  >
+                    Open in new tab
+                  </a>
+                </div>
+              </div>
+            ))}
         </div>
       )}
     </main>
