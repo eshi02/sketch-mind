@@ -30,3 +30,4 @@ media/
 *.json
 !package.json
 !tsconfig.json
+!api.json
