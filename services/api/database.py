@@ -1,6 +1,8 @@
 """AlloyDB (PostgreSQL) database layer with pgvector semantic cache."""
-import os, uuid
+import os, uuid, logging
 import asyncpg
+
+logger = logging.getLogger(__name__)
 
 ALLOYDB_HOST = os.getenv("ALLOYDB_HOST", "127.0.0.1")
 ALLOYDB_PORT = int(os.getenv("ALLOYDB_PORT", "5432"))
@@ -8,7 +10,7 @@ ALLOYDB_DB = os.getenv("ALLOYDB_DB", "sketchmind")
 ALLOYDB_USER = os.getenv("ALLOYDB_USER", "postgres")
 ALLOYDB_PASS = os.getenv("ALLOYDB_PASS", "changeme")
 
-SIMILARITY_THRESHOLD = 0.85
+SIMILARITY_THRESHOLD = float(os.getenv("SIMILARITY_THRESHOLD", "0.78"))
 
 pool: asyncpg.Pool | None = None
 
@@ -35,9 +37,9 @@ async def init_db():
             );
         """)
         await conn.execute("""
-            CREATE INDEX IF NOT EXISTS idx_videos_embedding
-            ON videos USING ivfflat (embedding vector_cosine_ops)
-            WITH (lists = 10);
+            CREATE INDEX IF NOT EXISTS idx_videos_embedding_hnsw
+            ON videos USING hnsw (embedding vector_cosine_ops)
+            WITH (m = 16, ef_construction = 64);
         """)
         # New columns for parent-child multi-video support
         for col, typedef in [
@@ -65,6 +67,14 @@ async def check_semantic_cache(embedding: list[float]) -> dict | None:
             """,
             str(embedding),
         )
+        if row:
+            logger.info(
+                "Cache lookup: best match topic=%r similarity=%.4f threshold=%.2f hit=%s",
+                row["topic"], float(row["similarity"]),
+                SIMILARITY_THRESHOLD, row["similarity"] >= SIMILARITY_THRESHOLD,
+            )
+        else:
+            logger.info("Cache lookup: no completed videos found")
         if row and row["similarity"] >= SIMILARITY_THRESHOLD:
             parent_id = row["id"]
             # Fetch child subtopic videos

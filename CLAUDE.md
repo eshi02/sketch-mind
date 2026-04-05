@@ -4,20 +4,34 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What This Is
 
-SketchMind is an AI-powered platform that transforms topics into animated educational videos. A user submits a topic, an agent pipeline (research → script → Manim code → render) produces an MP4, and the video is returned via WebSocket.
+SketchMind is an AI-powered platform that transforms topics into animated educational videos. A user submits a topic, an agent pipeline (research → script → Manim code → render) produces MP4s, and videos are returned via WebSocket.
 
 ## Architecture
 
-Four microservices, each a separate FastAPI/Next.js app deployed to Google Cloud Run:
+Four microservices deployed to Google Cloud Run:
 
-- **web** (`:3000`) — Next.js 14 App Router frontend. Submits topics to the API, polls status via WebSocket.
-- **api** (`:8080`) — FastAPI gateway. Handles semantic caching (pgvector cosine similarity, threshold 0.85), creates sessions in AlloyDB, delegates to agents service, streams status over WebSocket.
-- **agents** (`:8081`) — Google ADK orchestrator with 4 agents (researcher → scriptwriter → manim_coder → orchestrator). Uses Gemini 2.5 Flash. The orchestrator auto-retries failed renders up to 2 times.
-- **renderer** (`:8082`) — Executes Manim Python code in a subprocess, uploads MP4 to GCS, returns public URL.
+- **web** (`services/web`, `:3000`) — Next.js 14 App Router frontend. Single-page app in `app/page.tsx`. Submits topics via REST, polls status via WebSocket.
+- **api** (`services/api`, `:8080`) — FastAPI gateway. Semantic caching with pgvector (cosine similarity threshold 0.85), session management in AlloyDB, delegates to agents service, streams status over WebSocket.
+- **agents** (`services/agents`, `:8081`) — Google ADK agent orchestrator. Two-phase design: Phase 1 researches and splits topic into subtopics, Phase 2 processes each subtopic in parallel.
+- **renderer** (`services/renderer`, `:8082`) — Executes Manim Python code in a subprocess, uploads MP4 to GCS, returns public URL.
 
-**Request flow:** Web → API `/api/generate` → (cache check via embeddings) → Agents `/generate` → Renderer `/render` → GCS → video URL returned through chain.
+**Request flow:** Web → API `POST /api/generate` → (cache check via embeddings) → Agents `POST /research` → returns subtopics → API fans out parallel calls to Agents `POST /process-subtopic` (NDJSON streaming) → each subtopic runs scriptwriter → manim_generator → render+fix loop → Renderer `POST /render` → GCS → video URLs streamed back through WebSocket.
 
-**Service-to-service auth:** Internal services (agents, renderer) use GCP ID tokens. Auth is skipped when the URL doesn't contain `run.app` (i.e., local dev).
+**Service-to-service auth:** Internal services use GCP ID tokens. Auth is skipped when the URL doesn't contain `run.app` (local dev). See `_auth_headers()` in `services/api/main.py`.
+
+## Agent Pipeline Details
+
+Defined in `services/agents/agent.py`. Two top-level agents returned by `create_agents()`:
+
+1. **researcher** — Breaks topic into 1-4 subtopics as JSON. Uses `google_search` tool. Output stored in `CURRICULUM_JSON` state key.
+2. **subtopic_pipeline** (SequentialAgent) — Processes a single subtopic end-to-end:
+   - `scriptwriter` → outputs JSON scene script (`SCRIPT_JSON`)
+   - `manim_generator` → outputs raw Python code (`MANIM_CODE`). Uses MCP tools (`list_manim_animations`, `lookup_manim_class`, `search_manim_api`) from the Manim API MCP server at `mcp_servers/manim_api_server.py`.
+   - `render_and_fix_loop` (LoopAgent, max 5 iterations) — alternates between `renderer` agent (calls `render_manim_video` tool, exits loop on success) and `manim_fixer` agent (debugs using MCP tools, rewrites `MANIM_CODE`).
+
+All agents use `gemini-2.5-flash`. The generated Manim scene class must be named `GeneratedScene`.
+
+The agents service exposes two endpoints: `POST /research` (returns subtopics JSON) and `POST /process-subtopic` (streams NDJSON stage updates).
 
 ## Commands
 
@@ -38,6 +52,12 @@ uvicorn main:app --reload --port <port>
 ```
 Ports: api=8080, agents=8081, renderer=8082
 
+### Local dev with Docker Compose
+```bash
+docker-compose up     # starts all 4 services + pgvector DB
+```
+Docker Compose maps: db=5432, renderer=8082, agents=8081, api=8080, web=3000. The `db` service uses `pgvector/pgvector:pg16` with credentials `postgres/localpass`.
+
 ### Deploy all services to Cloud Run
 ```bash
 ./deploy.sh
@@ -54,14 +74,12 @@ Ports: api=8080, agents=8081, renderer=8082
 
 ## Database
 
-AlloyDB (PostgreSQL) with pgvector. Single `videos` table with 768-dim embeddings for semantic caching. Schema auto-created on API startup via `database.py:init_db()`.
+AlloyDB (PostgreSQL) with pgvector. Schema auto-created on API startup via `database.py:init_db()`. Uses 768-dim embeddings for semantic caching. Locally, Docker Compose provides a pgvector container.
 
-## Agent Pipeline Details
+## Key Implementation Notes
 
-Defined in `services/agents/agent.py`. The `root_agent` (orchestrator) delegates sequentially:
-1. `researcher` — uses `google_search` tool
-2. `scriptwriter` — outputs JSON array of scenes
-3. `manim_coder` — outputs raw Python (class must be `GeneratedScene`)
-4. Orchestrator calls `render_manim_video` tool which POSTs to renderer service
-
-The render tool is in `services/agents/tools/render_tool.py`. It's a synchronous function registered as an ADK tool.
+- The API stores pipeline state in an in-memory `sessions` dict (not DB) for WebSocket polling. This means status is lost on API restart.
+- Subtopic processing is fully parallel via `asyncio.gather` in `services/api/main.py:run_pipeline()`.
+- The renderer has a 240-second subprocess timeout and cleans up temp directories in a `finally` block.
+- The web frontend is a single client component (`"use client"`) with inline styles — no CSS framework or component library.
+- No test framework is configured in any service. No linting tools are set up.

@@ -12,7 +12,7 @@ from database import (
     mark_subtopic_failed, complete_parent_session,
     mark_failed, get_all_videos,
 )
-from embeddings import generate_embedding
+from embeddings import generate_embedding, normalize_topic
 
 AGENTS_URL = os.getenv("AGENTS_SERVICE_URL")
 sessions: dict[str, dict] = {}
@@ -46,7 +46,8 @@ class TopicRequest(BaseModel):
 
 @app.post("/api/generate")
 async def generate_video(req: TopicRequest):
-    embedding = await generate_embedding(req.topic)
+    normalized = await normalize_topic(req.topic)
+    embedding = await generate_embedding(normalized)
 
     cached = await check_semantic_cache(embedding)
     if cached:
