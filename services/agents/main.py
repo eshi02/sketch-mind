@@ -19,27 +19,6 @@ logging.getLogger("httpx").setLevel(logging.WARNING)
 
 app = FastAPI(title="SketchMind Agents")
 
-# Agent instances — initialized async on startup
-_researcher = None
-_subtopic_pipeline = None
-_mcp_toolset: McpToolset | None = None
-
-
-@app.on_event("startup")
-async def startup():
-    global _researcher, _subtopic_pipeline, _mcp_toolset
-    logger.info("Initializing agents and MCP toolsets...")
-    _researcher, _subtopic_pipeline, _mcp_toolset = await create_agents()
-    logger.info("Agents initialized successfully with Manim MCP tools.")
-
-
-@app.on_event("shutdown")
-async def shutdown():
-    global _mcp_toolset
-    if _mcp_toolset:
-        logger.info("Closing MCP server connections...")
-        await _mcp_toolset.close()
-
 # Map ADK agent names to user-friendly stage descriptions
 AGENT_STAGES = {
     "scriptwriter": {"stage": "scripting", "message": "Writing video script..."},
@@ -69,45 +48,49 @@ class ResearchRequest(BaseModel):
 @app.post("/research")
 async def research(req: ResearchRequest):
     """Run the researcher agent and return parsed subtopics."""
-    session_service = InMemorySessionService()
-    runner = Runner(
-        agent=_researcher, app_name="sketchmind", session_service=session_service
-    )
-    session = await session_service.create_session(
-        app_name="sketchmind", user_id="user"
-    )
-
-    logger.info(f"Research: topic={req.topic}")
-    t0 = time.time()
-    async for _ in runner.run_async(
-        user_id="user",
-        session_id=session.id,
-        new_message=types.Content(
-            role="user",
-            parts=[types.Part.from_text(
-                text=f"Create an educational video explaining: {req.topic}"
-            )],
-        ),
-    ):
-        pass
-    logger.info(f"Research completed in {time.time() - t0:.1f}s")
-
-    state = (await session_service.get_session(
-        app_name="sketchmind", user_id="user", session_id=session.id
-    )).state
-    raw = state.get("CURRICULUM_JSON", "[]")
-    logger.info(f"CURRICULUM_JSON: {str(raw)[:500]}")
-
+    researcher, _, mcp_toolset = await create_agents()
     try:
-        subtopics = json.loads(raw) if isinstance(raw, str) else raw
-    except json.JSONDecodeError:
-        m = re.search(r'\[.*\]', str(raw), re.DOTALL)
-        subtopics = json.loads(m.group(0)) if m else []
+        session_service = InMemorySessionService()
+        runner = Runner(
+            agent=researcher, app_name="sketchmind", session_service=session_service
+        )
+        session = await session_service.create_session(
+            app_name="sketchmind", user_id="user"
+        )
 
-    if not isinstance(subtopics, list) or len(subtopics) == 0:
-        return {"status": "error", "error": "No subtopics generated", "subtopics": []}
+        logger.info(f"Research: topic={req.topic}")
+        t0 = time.time()
+        async for _ in runner.run_async(
+            user_id="user",
+            session_id=session.id,
+            new_message=types.Content(
+                role="user",
+                parts=[types.Part.from_text(
+                    text=f"Create an educational video explaining: {req.topic}"
+                )],
+            ),
+        ):
+            pass
+        logger.info(f"Research completed in {time.time() - t0:.1f}s")
 
-    return {"status": "ok", "subtopics": subtopics}
+        state = (await session_service.get_session(
+            app_name="sketchmind", user_id="user", session_id=session.id
+        )).state
+        raw = state.get("CURRICULUM_JSON", "[]")
+        logger.info(f"CURRICULUM_JSON: {str(raw)[:500]}")
+
+        try:
+            subtopics = json.loads(raw) if isinstance(raw, str) else raw
+        except json.JSONDecodeError:
+            m = re.search(r'\[.*\]', str(raw), re.DOTALL)
+            subtopics = json.loads(m.group(0)) if m else []
+
+        if not isinstance(subtopics, list) or len(subtopics) == 0:
+            return {"status": "error", "error": "No subtopics generated", "subtopics": []}
+
+        return {"status": "ok", "subtopics": subtopics}
+    finally:
+        await mcp_toolset.close()
 
 
 # ---------------------------------------------------------------------------
@@ -129,10 +112,13 @@ async def process_subtopic(req: SubtopicRequest):
         # Emit initial stage
         yield json.dumps({"stage": "starting", "message": f"Processing: {title}"}) + "\n"
 
+        # Each subtopic gets its own agents + MCP subprocess to avoid
+        # shared-state and stdio-pipe contention between concurrent runs.
+        _, subtopic_pipeline, mcp_toolset = await create_agents()
         try:
             session_service = InMemorySessionService()
             runner = Runner(
-                agent=_subtopic_pipeline,
+                agent=subtopic_pipeline,
                 app_name="sketchmind",
                 session_service=session_service,
             )
@@ -214,6 +200,8 @@ async def process_subtopic(req: SubtopicRequest):
                 "index": req.index,
                 "error": str(e),
             }) + "\n"
+        finally:
+            await mcp_toolset.close()
 
     return StreamingResponse(event_stream(), media_type="application/x-ndjson")
 

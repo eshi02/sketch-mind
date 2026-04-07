@@ -146,7 +146,10 @@ async def _process_single_subtopic(video_id: str, subtopic_data: dict, index: in
     )
 
     try:
-        async with httpx.AsyncClient(timeout=600, headers=_auth_headers()) as client:
+        # connect=30s, but read timeout=600s so we don't hang forever
+        # on a stuck agents service. Pool timeout prevents connection starvation.
+        timeouts = httpx.Timeout(connect=30, read=600, write=30, pool=60)
+        async with httpx.AsyncClient(timeout=timeouts, headers=_auth_headers()) as client:
             async with client.stream(
                 "POST",
                 f"{AGENTS_URL}/process-subtopic",
@@ -178,6 +181,15 @@ async def _process_single_subtopic(video_id: str, subtopic_data: dict, index: in
                                 child_id, event.get("error", "No video")
                             )
 
+    except (httpx.ReadTimeout, httpx.ConnectTimeout, httpx.PoolTimeout) as e:
+        error_msg = f"Timeout waiting for agents service: {type(e).__name__}"
+        logger.error(f"Subtopic [{index}] '{title}': {error_msg}")
+        sessions[video_id]["subtopics"][index].update({
+            "stage": "failed",
+            "message": error_msg,
+            "error": error_msg,
+        })
+        await mark_subtopic_failed(child_id, error_msg)
     except Exception as e:
         sessions[video_id]["subtopics"][index].update({
             "stage": "failed",

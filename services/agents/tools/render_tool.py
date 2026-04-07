@@ -42,5 +42,9 @@ def render_manim_video(python_code: str, audio_script: str = "") -> dict:
             timeout=300,
         )
         return resp.json()
+    except httpx.TimeoutException:
+        return {"status": "error", "error": "INFRASTRUCTURE_ERROR: Renderer service timed out. Do NOT retry or fix code — call exit_loop immediately."}
+    except httpx.ConnectError:
+        return {"status": "error", "error": "INFRASTRUCTURE_ERROR: Cannot reach renderer service. Do NOT retry or fix code — call exit_loop immediately."}
     except Exception as e:
         return {"status": "error", "error": str(e)}
