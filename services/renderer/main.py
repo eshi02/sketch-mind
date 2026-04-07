@@ -1,4 +1,5 @@
-import os, subprocess, tempfile, uuid, time, logging, re
+import os, subprocess, tempfile, uuid, time, logging, re, asyncio
+from functools import partial
 from fastapi import FastAPI
 from pydantic import BaseModel
 from google.cloud import storage
@@ -134,8 +135,9 @@ def _merge_with_sync(video_path: str, audio_path: str, output_path: str) -> bool
         return False
 
 
-@app.post("/render")
-async def render_video(req: RenderRequest):
+def _render_sync(req_python_code: str, req_scene_class_name: str,
+                  req_quality: str, req_audio_script: str | None) -> dict:
+    """All blocking work runs here — called from a thread pool."""
     start = time.time()
     rid = uuid.uuid4().hex[:8]
     work_dir = tempfile.mkdtemp(prefix=f"m_{rid}_")
@@ -143,10 +145,10 @@ async def render_video(req: RenderRequest):
     try:
         # Step 1: If audio script provided, synthesize speech first
         audio_path = None
-        if req.audio_script:
+        if req_audio_script:
             t1 = time.time()
             audio_path = os.path.join(work_dir, "narration.mp3")
-            tts_ok = _synthesize_speech(req.audio_script, audio_path)
+            tts_ok = _synthesize_speech(req_audio_script, audio_path)
             logger.info("[%s] TTS: %.1fs (%s)", rid, time.time() - t1, "ok" if tts_ok else "failed")
             if not tts_ok:
                 audio_path = None  # fall back to silent video
@@ -155,11 +157,11 @@ async def render_video(req: RenderRequest):
         t2 = time.time()
         scene_file = os.path.join(work_dir, "scene.py")
         with open(scene_file, "w") as f:
-            f.write(req.python_code)
+            f.write(req_python_code)
 
         result = subprocess.run(
-            ["python3", "-m", "manim", "render", f"-q{req.quality}",
-             "--media_dir", work_dir, scene_file, req.scene_class_name],
+            ["python3", "-m", "manim", "render", f"-q{req_quality}",
+             "--media_dir", work_dir, scene_file, req_scene_class_name],
             capture_output=True, text=True, timeout=240, cwd=work_dir,
         )
         logger.info("[%s] Manim render: %.1fs (exit=%d)", rid, time.time() - t2, result.returncode)
@@ -168,7 +170,7 @@ async def render_video(req: RenderRequest):
             return {"status": "error", "error": result.stderr[-1500:]}
 
         qmap = {"l": "480p15", "m": "720p30", "h": "1080p60"}
-        vdir = os.path.join(work_dir, "videos", "scene", qmap.get(req.quality, "720p30"))
+        vdir = os.path.join(work_dir, "videos", "scene", qmap.get(req_quality, "720p30"))
         vfiles = [f for f in os.listdir(vdir) if f.endswith(".mp4")]
         if not vfiles:
             return {"status": "error", "error": "No .mp4 produced"}
@@ -192,7 +194,7 @@ async def render_video(req: RenderRequest):
         # Step 4: Upload to GCS
         t4 = time.time()
         client = storage.Client(project=os.getenv("GOOGLE_CLOUD_PROJECT"))
-        blob = client.bucket(GCS_BUCKET).blob(f"videos/{rid}_{req.scene_class_name}.mp4")
+        blob = client.bucket(GCS_BUCKET).blob(f"videos/{rid}_{req_scene_class_name}.mp4")
         blob.upload_from_filename(upload_path, content_type="video/mp4")
         blob.make_public()
         logger.info("[%s] GCS upload: %.1fs", rid, time.time() - t4)
@@ -209,6 +211,16 @@ async def render_video(req: RenderRequest):
         return {"status": "error", "error": str(e)}
     finally:
         subprocess.run(["rm", "-rf", work_dir], capture_output=True)
+
+
+@app.post("/render")
+async def render_video(req: RenderRequest):
+    loop = asyncio.get_event_loop()
+    return await loop.run_in_executor(
+        None,
+        partial(_render_sync, req.python_code, req.scene_class_name,
+                req.quality, req.audio_script),
+    )
 
 
 @app.get("/health")
