@@ -11,7 +11,7 @@ SketchMind is an AI-powered platform that transforms topics into animated educat
 Four microservices deployed to Google Cloud Run:
 
 - **web** (`services/web`, `:3000`) — Next.js 14 App Router frontend. Single-page app in `app/page.tsx`. Submits topics via REST, polls status via WebSocket.
-- **api** (`services/api`, `:8080`) — FastAPI gateway. Semantic caching with pgvector (cosine similarity threshold 0.85), session management in AlloyDB, delegates to agents service, streams status over WebSocket.
+- **api** (`services/api`, `:8080`) — FastAPI gateway. Semantic caching with pgvector (cosine similarity threshold 0.78), session management in Cloud SQL PostgreSQL, delegates to agents service, streams status over WebSocket.
 - **agents** (`services/agents`, `:8081`) — Google ADK agent orchestrator. Two-phase design: Phase 1 researches and splits topic into subtopics, Phase 2 processes each subtopic in parallel.
 - **renderer** (`services/renderer`, `:8082`) — Executes Manim Python code in a subprocess, uploads MP4 to GCS, returns public URL.
 
@@ -69,12 +69,13 @@ Docker Compose maps: db=5432, renderer=8082, agents=8081, api=8080, web=3000. Th
 - `AGENTS_SERVICE_URL` — agents service URL used by api
 - `RENDER_SERVICE_URL` — renderer service URL used by agents
 - `GCS_BUCKET` — GCS bucket name for video storage
-- `ALLOYDB_HOST`, `ALLOYDB_PASS`, `ALLOYDB_DB` — database connection
+- `DB_HOST`, `DB_PORT`, `DB_NAME`, `DB_USER`, `DB_PASS` — database connection (TCP, used locally)
+- `DB_UNIX_SOCKET` — Cloud SQL Unix socket path (used in production, e.g. `/cloudsql/PROJECT:REGION:INSTANCE`)
 - `GOOGLE_CLOUD_PROJECT`, `GCP_LOCATION` — GCP project config (location defaults to `asia-south1`)
 
 ## Database
 
-AlloyDB (PostgreSQL) with pgvector. Schema auto-created on API startup via `database.py:init_db()`. Uses 768-dim embeddings for semantic caching. Locally, Docker Compose provides a pgvector container.
+Cloud SQL PostgreSQL 16 with pgvector. Schema auto-created on API startup via `database.py:init_db()`. Uses 768-dim embeddings for semantic caching. In production, Cloud Run connects via Unix socket (`--add-cloudsql-instances`). Locally, Docker Compose provides a pgvector container over TCP.
 
 ## Key Implementation Notes
 

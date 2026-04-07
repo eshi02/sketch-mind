@@ -1,5 +1,5 @@
 """Agent service: research endpoint + streaming subtopic endpoint."""
-import json, re, logging
+import json, re, logging, time
 from google.adk.tools.mcp_tool import McpToolset
 from fastapi import FastAPI
 from fastapi.responses import StreamingResponse
@@ -11,6 +11,11 @@ from agent import create_agents
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("sketchmind-agents")
+
+# Suppress noisy ADK/Gemini request/response logs
+logging.getLogger("google_adk").setLevel(logging.WARNING)
+logging.getLogger("google_genai").setLevel(logging.WARNING)
+logging.getLogger("httpx").setLevel(logging.WARNING)
 
 app = FastAPI(title="SketchMind Agents")
 
@@ -73,6 +78,7 @@ async def research(req: ResearchRequest):
     )
 
     logger.info(f"Research: topic={req.topic}")
+    t0 = time.time()
     async for _ in runner.run_async(
         user_id="user",
         session_id=session.id,
@@ -84,6 +90,7 @@ async def research(req: ResearchRequest):
         ),
     ):
         pass
+    logger.info(f"Research completed in {time.time() - t0:.1f}s")
 
     state = (await session_service.get_session(
         app_name="sketchmind", user_id="user", session_id=session.id
@@ -137,6 +144,8 @@ async def process_subtopic(req: SubtopicRequest):
             final_text = ""
             video_url = None
             last_stage = None
+            stage_start = time.time()
+            pipeline_start = stage_start
 
             async for event in runner.run_async(
                 user_id="user",
@@ -151,6 +160,10 @@ async def process_subtopic(req: SubtopicRequest):
                 # Emit stage changes based on which agent is active
                 author = getattr(event, "author", "")
                 if author in AGENT_STAGES and author != last_stage:
+                    now = time.time()
+                    if last_stage:
+                        logger.info(f"[Subtopic {req.index}] {last_stage} took {now - stage_start:.1f}s")
+                    stage_start = now
                     last_stage = author
                     yield json.dumps(AGENT_STAGES[author]) + "\n"
 
@@ -177,6 +190,11 @@ async def process_subtopic(req: SubtopicRequest):
                             break
                 if not video_url and final_text:
                     video_url = _extract_video_url(final_text)
+
+            # Log final stage timing
+            if last_stage:
+                logger.info(f"[Subtopic {req.index}] {last_stage} took {time.time() - stage_start:.1f}s")
+            logger.info(f"[Subtopic {req.index}] Total pipeline: {time.time() - pipeline_start:.1f}s — {'success' if video_url else 'failed'}")
 
             # Final result line
             yield json.dumps({

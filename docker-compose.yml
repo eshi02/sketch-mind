@@ -47,11 +47,11 @@ services:
     environment:
       AGENTS_SERVICE_URL: http://agents:8080
       GCP_PROJECT_ID: ${GOOGLE_CLOUD_PROJECT}
-      ALLOYDB_HOST: db
-      ALLOYDB_PORT: "5432"
-      ALLOYDB_DB: sketchmind
-      ALLOYDB_USER: postgres
-      ALLOYDB_PASS: localpass
+      DB_HOST: db
+      DB_PORT: "5432"
+      DB_NAME: sketchmind
+      DB_USER: postgres
+      DB_PASS: localpass
       GOOGLE_APPLICATION_CREDENTIALS: /gcp/creds.json
     volumes:
       - ${GOOGLE_APPLICATION_CREDENTIALS:-~/.config/gcloud/application_default_credentials.json}:/gcp/creds.json:ro

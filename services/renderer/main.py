@@ -144,12 +144,15 @@ async def render_video(req: RenderRequest):
         # Step 1: If audio script provided, synthesize speech first
         audio_path = None
         if req.audio_script:
+            t1 = time.time()
             audio_path = os.path.join(work_dir, "narration.mp3")
             tts_ok = _synthesize_speech(req.audio_script, audio_path)
+            logger.info("[%s] TTS: %.1fs (%s)", rid, time.time() - t1, "ok" if tts_ok else "failed")
             if not tts_ok:
                 audio_path = None  # fall back to silent video
 
         # Step 2: Render Manim video
+        t2 = time.time()
         scene_file = os.path.join(work_dir, "scene.py")
         with open(scene_file, "w") as f:
             f.write(req.python_code)
@@ -159,6 +162,7 @@ async def render_video(req: RenderRequest):
              "--media_dir", work_dir, scene_file, req.scene_class_name],
             capture_output=True, text=True, timeout=240, cwd=work_dir,
         )
+        logger.info("[%s] Manim render: %.1fs (exit=%d)", rid, time.time() - t2, result.returncode)
 
         if result.returncode != 0:
             return {"status": "error", "error": result.stderr[-1500:]}
@@ -175,8 +179,10 @@ async def render_video(req: RenderRequest):
 
         # Step 3: Merge audio with video if TTS succeeded
         if audio_path:
+            t3 = time.time()
             final_video = os.path.join(work_dir, "final.mp4")
             merge_ok = _merge_with_sync(silent_video, audio_path, final_video)
+            logger.info("[%s] FFmpeg merge: %.1fs (%s)", rid, time.time() - t3, "ok" if merge_ok else "failed")
             if merge_ok:
                 upload_path = final_video
                 has_audio = True
@@ -184,14 +190,18 @@ async def render_video(req: RenderRequest):
                 logger.warning("Audio merge failed, uploading silent video")
 
         # Step 4: Upload to GCS
+        t4 = time.time()
         client = storage.Client(project=os.getenv("GOOGLE_CLOUD_PROJECT"))
         blob = client.bucket(GCS_BUCKET).blob(f"videos/{rid}_{req.scene_class_name}.mp4")
         blob.upload_from_filename(upload_path, content_type="video/mp4")
         blob.make_public()
+        logger.info("[%s] GCS upload: %.1fs", rid, time.time() - t4)
 
+        total = round(time.time() - start, 1)
+        logger.info("[%s] Total render: %.1fs (audio=%s)", rid, total, has_audio)
         return {"status": "success", "video_url": blob.public_url,
                 "has_audio": has_audio,
-                "render_time": round(time.time() - start, 1)}
+                "render_time": total}
 
     except subprocess.TimeoutExpired:
         return {"status": "error", "error": "Render timed out (>4 min)"}

@@ -184,34 +184,44 @@ async def create_agents():
         model="gemini-2.5-flash",
         description="Debugs, holistically reviews, and fixes failed Manim Python code.",
         instruction="""You are an expert Manim Community Edition (v0.20.1) debugging specialist.
-    The previous render failed. Your job is to fix the code and ensure it is flawless.
+    The previous render failed. Your job is to fix the code, verify EVERY class and method, and ensure it is flawless.
 
     Original Script Intent: {SCRIPT_JSON?}
     Failed Code: {MANIM_CODE?}
     Python Traceback / Error: {RENDER_ERROR?}
 
-    WORKFLOW:
+    === PHASE 1: FIX THE ERROR ===
     1. Analyze the traceback to identify the root cause.
-    2. Use `lookup_manim_class` to verify the CORRECT signature of any class mentioned
-       in the error (e.g., if TypeError about args, look up the actual constructor).
+    2. Use `lookup_manim_class` to verify the CORRECT constructor signature of the class that caused the error.
     3. Use `search_manim_api` if the error suggests a deprecated or non-existent method.
-    4. Scan the ENTIRE code for similar anti-patterns and fix ALL of them.
+    4. Fix the root cause.
 
-    DIAGNOSTIC RULES:
-    1.  **Holistic Review:** DO NOT just fix the single line that failed. Scan the ENTIRE code
-        for similar anti-patterns, deprecated methods, or identical mistakes.
-    2.  **Type Safety:** Are `VGroup`s only containing VMobjects? (If mixed, use `Group`).
-    3.  **Deprecated Methods:** No `ShowCreation` (use `Create`). No `get_graph` (use `plot`).
-    4.  **Positioning:** Ensure no objects overlap. Use `next_to`, `shift`, `to_edge`.
-        All elements must stay within x=[-6, 6] and y=[-3.5, 3.5]. Use `.scale()` if elements are too large.
-    5.  **No ImageMobject or SVGMobject.**
-    6.  **Mental Dry-Run:** Step through the animation mentally. Ensure pacing and no off-screen objects.
-    7.  **MANDATORY SCENE CLEARING:** Between visual sections, use `self.play(FadeOut(*self.mobjects))`
-        to clear the canvas. Never accumulate elements from previous sections.
-    8.  **Text Size:** Text elements should use font_size=36 or smaller. Max 5 words per text element.
-    9.  **MAX 5 ELEMENTS:** No more than 5 visible elements on screen at any time.
-    10. **SIMPLIFY:** If the code tries to build complex multi-element structures (molecule diagrams,
-        circuit boards, etc.) that cause overlap, replace them with simple shapes and labels.
+    === PHASE 2: FULL CODE AUDIT (MANDATORY) ===
+    After fixing the error, you MUST audit the ENTIRE code top-to-bottom. Do NOT skip this phase.
+
+    For EVERY Manim class used in the code (Text, MathTex, Axes, Circle, Arrow, VGroup, etc.):
+    1. Call `lookup_manim_class` to verify its constructor signature.
+    2. Check that all arguments passed match the verified signature.
+    3. If any argument is wrong, fix it immediately.
+
+    Checklist — verify ALL of these before outputting:
+    [ ] Every Manim class constructor matches the verified API signature
+    [ ] No deprecated methods: ShowCreation→Create, get_graph→plot, ShowPassingFlash→correct alternative
+    [ ] VGroup contains only VMobjects (use Group for mixed types)
+    [ ] No ImageMobject or SVGMobject
+    [ ] All elements within x=[-6, 6] and y=[-3.5, 3.5] — use .scale() if too large
+    [ ] No overlapping elements — track positions mentally, use next_to/shift/to_edge
+    [ ] Scene cleared with self.play(FadeOut(*self.mobjects)) between visual sections
+    [ ] Max 5 elements visible on screen at any time
+    [ ] Text elements are 1-5 words max, font_size=36 or smaller (48 for titles only)
+    [ ] self.wait(1) after major animation blocks
+    [ ] All imports are correct and present
+
+    === PHASE 3: SIMPLIFY IF NEEDED ===
+    If the code has more than 3 issues or tries to build complex structures (molecule diagrams,
+    circuit boards, neural networks, detailed layouts with 10+ elements), REWRITE it from scratch
+    using only simple shapes: Circle, Square, Rectangle, Arrow, Line, Dot, Text, MathTex, Axes.
+    A simple animation that renders is ALWAYS better than a complex one that fails.
 
     Output ONLY the FULL, corrected raw Python code. No markdown blocks, no backticks, no explanation.
     The class MUST remain named `GeneratedScene`.

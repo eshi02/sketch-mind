@@ -1,14 +1,15 @@
-"""AlloyDB (PostgreSQL) database layer with pgvector semantic cache."""
+"""Cloud SQL PostgreSQL database layer with pgvector semantic cache."""
 import os, uuid, logging
 import asyncpg
 
 logger = logging.getLogger(__name__)
 
-ALLOYDB_HOST = os.getenv("ALLOYDB_HOST", "127.0.0.1")
-ALLOYDB_PORT = int(os.getenv("ALLOYDB_PORT", "5432"))
-ALLOYDB_DB = os.getenv("ALLOYDB_DB", "sketchmind")
-ALLOYDB_USER = os.getenv("ALLOYDB_USER", "postgres")
-ALLOYDB_PASS = os.getenv("ALLOYDB_PASS", "changeme")
+DB_HOST = os.getenv("DB_HOST", "127.0.0.1")
+DB_PORT = int(os.getenv("DB_PORT", "5432"))
+DB_NAME = os.getenv("DB_NAME", "sketchmind")
+DB_USER = os.getenv("DB_USER", "postgres")
+DB_PASS = os.getenv("DB_PASS", "changeme")
+DB_UNIX_SOCKET = os.getenv("DB_UNIX_SOCKET", "")  # e.g. /cloudsql/PROJECT:REGION:INSTANCE
 
 SIMILARITY_THRESHOLD = float(os.getenv("SIMILARITY_THRESHOLD", "0.78"))
 
@@ -18,11 +19,16 @@ pool: asyncpg.Pool | None = None
 async def init_db():
     """Create connection pool and ensure tables + pgvector extension exist."""
     global pool
-    pool = await asyncpg.create_pool(
-        host=ALLOYDB_HOST, port=ALLOYDB_PORT, database=ALLOYDB_DB,
-        user=ALLOYDB_USER, password=ALLOYDB_PASS,
+    connect_kwargs = dict(
+        database=DB_NAME, user=DB_USER, password=DB_PASS,
         min_size=2, max_size=10,
     )
+    if DB_UNIX_SOCKET:
+        connect_kwargs["host"] = DB_UNIX_SOCKET
+    else:
+        connect_kwargs["host"] = DB_HOST
+        connect_kwargs["port"] = DB_PORT
+    pool = await asyncpg.create_pool(**connect_kwargs)
     async with pool.acquire() as conn:
         await conn.execute("CREATE EXTENSION IF NOT EXISTS vector;")
         await conn.execute("""

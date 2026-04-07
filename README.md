@@ -35,9 +35,9 @@ User enters topic
 - **Animation**: Manim Community Edition
 - **Backend**: FastAPI, asyncpg
 - **Frontend**: Next.js 14 (App Router)
-- **Database**: AlloyDB (PostgreSQL) + pgvector for semantic caching
+- **Database**: Cloud SQL PostgreSQL 16 + pgvector for semantic caching
 - **Storage**: Google Cloud Storage
-- **Infra**: Google Cloud Run (4 services), VPC Connector
+- **Infra**: Google Cloud Run (4 services), Cloud SQL Unix socket connector
 
 ## Project Structure
 
@@ -77,7 +77,6 @@ sketchmind/
 
 - Google Cloud project with billing enabled
 - `gcloud` CLI authenticated
-- AlloyDB instance with pgvector extension
 - GCS bucket for video storage
 
 ### Environment Variables
@@ -87,22 +86,34 @@ Create a `.env` file:
 ```env
 GOOGLE_CLOUD_PROJECT=your-project-id
 GCP_LOCATION=asia-south1
-ALLOYDB_HOST=your-alloydb-ip
-ALLOYDB_PORT=5432
-ALLOYDB_DB=sketchmind
-ALLOYDB_USER=postgres
-ALLOYDB_PASS=your-password
+DB_HOST=127.0.0.1
+DB_PORT=5432
+DB_NAME=sketchmind
+DB_USER=postgres
+DB_PASS=your-password
+CLOUD_SQL_INSTANCE=your-project-id:asia-south1:sketchmind-db
 GCS_BUCKET=your-project-id-sketchmind-videos
 ```
 
-### Deploy
+### Local Development
+
+```bash
+docker-compose up     # starts all 4 services + pgvector DB
+```
+
+### Deploy to Cloud Run
 
 ```bash
 chmod +x deploy.sh
 ./deploy.sh
 ```
 
-This builds and deploys all 4 services to Cloud Run, sets up IAM bindings for service-to-service auth, and prints the live URLs.
+The deploy script automatically:
+- Provisions a Cloud SQL PostgreSQL 16 instance with pgvector (if it doesn't exist)
+- Builds and deploys all 4 services to Cloud Run
+- Connects the API to Cloud SQL via Unix socket (`--add-cloudsql-instances`)
+- Sets up IAM bindings for service-to-service auth and Cloud SQL access
+- Prints the live URLs
 
 ## Key Features
 
