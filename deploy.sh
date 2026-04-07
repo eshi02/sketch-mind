@@ -34,10 +34,10 @@ else
     --project="$PROJECT_ID" \
     --region="$REGION" \
     --database-version=POSTGRES_16 \
+    --edition=enterprise \
     --tier=db-f1-micro \
     --storage-size=10GB \
-    --no-assign-ip \
-    --database-flags=cloudsql.enable_pgvector=on
+    --assign-ip
 
   echo "Setting postgres user password..."
   gcloud sql users set-password postgres \
@@ -84,7 +84,7 @@ gcloud run deploy sketchmind-agents \
     --image="$REGISTRY/agents" --region="$REGION" \
     --cpu=1 --memory=512Mi --timeout=300 \
     --min-instances=1 --max-instances=3 \
-    --set-env-vars="RENDER_SERVICE_URL=$RENDER_URL,GOOGLE_CLOUD_PROJECT=$PROJECT_ID,GOOGLE_CLOUD_LOCATION=$REGION" \
+    --set-env-vars="RENDER_SERVICE_URL=$RENDER_URL,GOOGLE_CLOUD_PROJECT=$PROJECT_ID,GOOGLE_CLOUD_LOCATION=$REGION,GOOGLE_GENAI_USE_VERTEXAI=true" \
     --no-allow-unauthenticated
 
 AGENTS_URL=$(gcloud run services describe sketchmind-agents \
