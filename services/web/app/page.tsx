@@ -90,11 +90,13 @@ const PIPELINE_STEPS = [
 ];
 
 const EXAMPLE_TOPICS = [
-  "How photosynthesis works",
-  "The Pythagorean theorem explained",
-  "How black holes form in space",
-  "Supply and demand in economics",
-  "How DNA replication works",
+  "Explain the concept of recursion in programming",
+  "How binary search algorithm works step by step",
+  "The Pythagorean theorem explained visually",
+  "How integration works in calculus",
+  "Trigonometry: sine, cosine and unit circle",
+  "How sorting algorithms compare: bubble vs quick sort",
+  "Explain Big O notation with examples",
 ];
 
 // ---------------------------------------------------------------------------
@@ -394,7 +396,7 @@ export default function Home() {
   // --- Generation pipeline ---
 
   async function handleGenerate() {
-    if (!topic.trim() || anonLimitReached) return;
+    if (!topic.trim() || anonLimitReached || loading) return;
 
     if (!user) {
       bumpAnonCount();

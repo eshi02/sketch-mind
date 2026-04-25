@@ -10,6 +10,7 @@ from google.adk.agents import Agent, BaseAgent, SequentialAgent, LoopAgent
 from google.adk.agents.invocation_context import InvocationContext
 from google.adk.events import Event, EventActions
 from google.adk.tools.mcp_tool import McpToolset
+from google.adk.tools.mcp_tool.mcp_session_manager import StdioConnectionParams
 from mcp import StdioServerParameters
 from tools.render_tool import render_manim_video
 
@@ -93,10 +94,12 @@ async def create_agents():
     The mcp_toolset must be kept alive for the app lifetime and closed on shutdown.
     """
     mcp_toolset = McpToolset(
-        connection_params=StdioServerParameters(
-            command="python",
-            args=[_MCP_SERVER_PATH],
-        )
+        connection_params=StdioConnectionParams(
+            server_params=StdioServerParameters(
+                command="python",
+                args=[_MCP_SERVER_PATH],
+            ),
+        ),
     )
     manim_tools = await mcp_toolset.get_tools()
 

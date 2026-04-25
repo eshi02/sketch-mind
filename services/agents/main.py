@@ -1,5 +1,13 @@
 """Agent service: research endpoint + streaming subtopic endpoint."""
-import json, re, logging, time
+import json, re, logging, time, warnings
+
+# authlib.deprecate calls simplefilter("always") at module level, overriding
+# any prior filter. Import it first, then re-apply our ignore filter so it
+# takes priority before the rest of the import chain triggers warnings.
+import authlib.deprecate  # noqa: E402
+warnings.filterwarnings("ignore", category=DeprecationWarning)
+warnings.filterwarnings("ignore", category=FutureWarning)
+
 from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from fastapi.responses import StreamingResponse
@@ -12,9 +20,9 @@ from agent import create_agents
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("sketchmind-agents")
 
-# Suppress noisy ADK/Gemini request/response logs
-logging.getLogger("google_adk").setLevel(logging.WARNING)
-logging.getLogger("google_genai").setLevel(logging.WARNING)
+# Suppress noisy ADK/Gemini library logs
+logging.getLogger("google_adk").setLevel(logging.ERROR)
+logging.getLogger("google_genai").setLevel(logging.ERROR)
 logging.getLogger("httpx").setLevel(logging.WARNING)
 
 
@@ -101,21 +109,20 @@ async def research(req: ResearchRequest):
     raw = state.get("CURRICULUM_JSON", "[]")
     logger.info(f"CURRICULUM_JSON: {str(raw)[:500]}")
 
-    def _fix_json(s: str) -> list:
-        """Parse JSON, fixing invalid LaTeX backslash escapes the LLM produces."""
-        # Replace lone backslashes (not valid JSON escapes) with double-backslash.
-        # Valid JSON escapes: \", \\, \/, \b, \f, \n, \r, \t, \uXXXX
-        fixed = re.sub(r'\\(?!["\\/bfnrtu])', r'\\\\', s)
-        return json.loads(fixed)
-
-    try:
-        subtopics = _fix_json(raw) if isinstance(raw, str) else raw
-    except json.JSONDecodeError:
-        m = re.search(r'\[.*\]', str(raw), re.DOTALL)
+    if isinstance(raw, str):
+        # Escape bare backslashes that aren't valid JSON escapes (e.g. LaTeX
+        # like \sin, \theta, \frac that the LLM puts in key_formulas).
+        fixed = re.sub(r'\\(?!["\\/bfnrtu])', r'\\\\', raw)
         try:
-            subtopics = _fix_json(m.group(0)) if m else []
-        except (json.JSONDecodeError, AttributeError):
-            subtopics = []
+            subtopics = json.loads(fixed)
+        except json.JSONDecodeError:
+            m = re.search(r'\[.*\]', fixed, re.DOTALL)
+            try:
+                subtopics = json.loads(m.group(0)) if m else []
+            except (json.JSONDecodeError, AttributeError):
+                subtopics = []
+    else:
+        subtopics = raw
 
     if not isinstance(subtopics, list) or len(subtopics) == 0:
         return {"status": "error", "error": "No subtopics generated", "subtopics": []}

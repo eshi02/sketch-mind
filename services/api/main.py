@@ -4,7 +4,10 @@ import asyncio
 import json
 import logging
 import os
+import warnings
 from contextlib import asynccontextmanager
+
+warnings.filterwarnings("ignore", category=UserWarning, module="vertexai")
 
 import httpx
 import google.auth.transport.requests
@@ -188,6 +191,14 @@ async def generate_video(req: TopicRequest, request: Request):
             "topic": cached["topic"],
         }
 
+    # Prevent duplicate in-flight generations for the same topic.
+    for sid, state in sessions.items():
+        if (
+            state.get("topic", "").lower() == req.topic.strip().lower()
+            and state["stage"] not in ("completed", "failed")
+        ):
+            return {"status": "processing", "session_id": sid}
+
     video_id = await create_session(req.topic, embedding)
     sessions[video_id] = {"stage": "starting", "topic": req.topic, "subtopics": []}
 
@@ -258,13 +269,17 @@ async def run_pipeline(video_id: str, topic: str, user_id: str | None = None) ->
 
         final_subtopics = sessions[video_id]["subtopics"]
         has_video = any(s.get("video_url") for s in final_subtopics)
-        sessions[video_id]["stage"] = "completed" if has_video else "failed"
-        if not has_video:
-            sessions[video_id]["error"] = "All subtopic videos failed"
 
+        # Write history BEFORE setting the completed stage so that when the
+        # WebSocket notifies the client and it fetches history, the record
+        # is already in the database.
         if user_id and has_video:
             h_id = generate_id()
             await add_search_history(h_id, user_id, topic, video_id, status="completed")
+
+        sessions[video_id]["stage"] = "completed" if has_video else "failed"
+        if not has_video:
+            sessions[video_id]["error"] = "All subtopic videos failed"
 
     except Exception as exc:
         await mark_failed(video_id, str(exc))

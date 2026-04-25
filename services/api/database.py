@@ -319,8 +319,17 @@ async def add_search_history(
     history_id: str, user_id: str, topic: str,
     session_id: str | None = None, status: str = "completed",
 ) -> None:
-    """Record a search in user history."""
+    """Record a search in user history. Skips duplicates for the same session."""
     async with pool.acquire() as conn:
+        if session_id:
+            exists = await conn.fetchval(
+                """SELECT 1 FROM search_history
+                   WHERE user_id = $1 AND session_id = $2 AND status = 'completed'
+                   LIMIT 1;""",
+                user_id, session_id,
+            )
+            if exists:
+                return
         await conn.execute(
             """INSERT INTO search_history (id, user_id, topic, session_id, status)
                VALUES ($1, $2, $3, $4, $5);""",

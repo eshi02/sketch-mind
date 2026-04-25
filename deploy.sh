@@ -13,7 +13,7 @@ if [ -f .env ]; then
   set -a; source .env; set +a
 fi
 
-for var in DB_PASS DB_USER DB_NAME; do
+for var in DB_PASS DB_USER DB_NAME JWT_SECRET GOOGLE_CLIENT_ID; do
   if [ -z "${!var:-}" ]; then
     echo "ERROR: $var is not set. Check your .env file."
     exit 1
@@ -98,7 +98,7 @@ gcloud run deploy sketchmind-api \
     --cpu=1 --memory=512Mi --timeout=300 \
     --min-instances=1 --max-instances=3 \
     --add-cloudsql-instances="$SQL_INSTANCE_CONNECTION" \
-    --set-env-vars="AGENTS_SERVICE_URL=$AGENTS_URL,GCP_PROJECT_ID=$PROJECT_ID,DB_NAME=$DB_NAME,DB_USER=$DB_USER,DB_PASS=$DB_PASS,DB_UNIX_SOCKET=/cloudsql/$SQL_INSTANCE_CONNECTION" \
+    --set-env-vars="AGENTS_SERVICE_URL=$AGENTS_URL,GCP_PROJECT_ID=$PROJECT_ID,DB_NAME=$DB_NAME,DB_USER=$DB_USER,DB_PASS=$DB_PASS,DB_UNIX_SOCKET=/cloudsql/$SQL_INSTANCE_CONNECTION,JWT_SECRET=${JWT_SECRET:-},GOOGLE_CLIENT_ID=${GOOGLE_CLIENT_ID:-}" \
     --allow-unauthenticated
 
 API_URL=$(gcloud run services describe sketchmind-api \
@@ -106,7 +106,10 @@ API_URL=$(gcloud run services describe sketchmind-api \
 
 # ── 4. Web ────────────────────────────────────────────
 echo ">>> Web..."
-echo "NEXT_PUBLIC_API_URL=$API_URL" > services/web/.env.production
+cat > services/web/.env.production <<EOF
+NEXT_PUBLIC_API_URL=$API_URL
+NEXT_PUBLIC_GOOGLE_CLIENT_ID=${GOOGLE_CLIENT_ID:-}
+EOF
 gcloud builds submit services/web --tag "$REGISTRY/web"
 gcloud run deploy sketchmind-web \
     --image="$REGISTRY/web" --region="$REGION" \
