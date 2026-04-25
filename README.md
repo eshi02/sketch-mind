@@ -60,10 +60,14 @@ sketchmind/
 │   │   ├── main.py
 │   │   ├── database.py
 │   │   ├── embeddings.py
+│   │   ├── auth.py            # Google OAuth + JWT sessions
 │   │   └── requirements.txt
 │   └── web/                   # Next.js frontend
 │       ├── Dockerfile
 │       ├── app/
+│       │   ├── page.tsx       # Main single-page app
+│       │   ├── auth-context.tsx # Auth state provider
+│       │   └── login/page.tsx # Google Sign-In page
 │       ├── next.config.js
 │       └── package.json
 ├── deploy.sh
@@ -93,6 +97,11 @@ DB_USER=postgres
 DB_PASS=your-password
 CLOUD_SQL_INSTANCE=your-project-id:asia-south1:sketchmind-db
 GCS_BUCKET=your-project-id-sketchmind-videos
+
+# Authentication
+GOOGLE_CLIENT_ID=your-google-oauth-client-id.apps.googleusercontent.com
+JWT_SECRET=your-jwt-secret-change-in-prod
+NEXT_PUBLIC_GOOGLE_CLIENT_ID=your-google-oauth-client-id.apps.googleusercontent.com
 ```
 
 ### Local Development
@@ -117,7 +126,14 @@ The deploy script automatically:
 
 ## Key Features
 
-- **Semantic caching** — repeated or similar topics return cached videos instantly (pgvector cosine similarity)
-- **Real-time status** — WebSocket updates as the pipeline progresses
-- **Auto-retry** — if Manim rendering fails, the orchestrator sends the error back to the coder agent for a fix (up to 2 retries)
+- **Multi-subtopic generation** — topics are broken into 1-4 subtopics, each producing its own video in parallel
+- **Semantic caching** — repeated or similar topics return cached videos instantly (pgvector cosine similarity, 0.78 threshold)
+- **Real-time status** — WebSocket updates as the pipeline progresses through research, scripting, coding, and rendering stages
+- **Auto-retry** — if Manim rendering fails, the orchestrator sends the error back to the coder agent for a fix (up to 5 retries)
 - **Isolated rendering** — heavy Manim workloads run in their own service with dedicated CPU/memory
+- **Google OAuth authentication** — sign in with Google to persist search history across sessions
+- **Search history** — view, replay, and manage past generations (individual delete + clear all)
+- **Background generation** — browse history while a video generates in the background, then restore the result
+- **Anonymous rate limiting** — 3 free generations for unauthenticated users, then sign-in required
+- **Example topics** — curated topic suggestions to help new users get started quickly
+- **Engaging loading UX** — pipeline progress indicator with rotating fun facts during generation

@@ -1,4 +1,5 @@
 import type { Metadata } from "next";
+import { AuthProvider } from "./auth-context";
 
 export const metadata: Metadata = {
   title: "SketchMind - AI Educational Videos",
@@ -12,8 +13,8 @@ export default function RootLayout({
 }) {
   return (
     <html lang="en">
-      <body style={{ margin: 0, fontFamily: "system-ui, sans-serif", background: "#0a0a0a", color: "#ededed" }}>
-        {children}
+      <body style={{ margin: 0, fontFamily: "'Inter', system-ui, -apple-system, sans-serif", background: "#050510", color: "#ededed" }}>
+        <AuthProvider>{children}</AuthProvider>
       </body>
     </html>
   );

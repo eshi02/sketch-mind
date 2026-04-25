@@ -5,3 +5,4 @@ google-auth
 httpx
 asyncpg
 python-dotenv
+PyJWT

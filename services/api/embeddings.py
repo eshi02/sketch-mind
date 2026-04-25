@@ -1,11 +1,15 @@
 """Generate text embeddings via Vertex AI for semantic caching."""
-import os, asyncio, logging
+
+import asyncio
+import logging
+import os
+
 from google.cloud import aiplatform
+
+logger = logging.getLogger(__name__)
 
 PROJECT_ID = os.getenv("GCP_PROJECT_ID", os.getenv("GOOGLE_CLOUD_PROJECT"))
 LOCATION = os.getenv("GCP_LOCATION", "asia-south1")
-
-logger = logging.getLogger(__name__)
 
 _embed_model = None
 _gen_model = None
@@ -43,9 +47,7 @@ async def normalize_topic(raw_topic: str) -> str:
         '  "Pythagorean theorem" → "Pythagorean Theorem"\n\n'
         f'User request: "{raw_topic}"'
     )
-    response = await asyncio.to_thread(
-        lambda: model.generate_content(prompt)
-    )
+    response = await asyncio.to_thread(lambda: model.generate_content(prompt))
     normalized = response.text.strip().strip('"').strip("'")
     logger.info("Topic normalization: %r → %r", raw_topic, normalized)
     return normalized
@@ -54,7 +56,5 @@ async def normalize_topic(raw_topic: str) -> str:
 async def generate_embedding(text: str) -> list[float]:
     """Generate a 768-dim embedding for the given text."""
     model = _get_embed_model()
-    embeddings = await asyncio.to_thread(
-        lambda: model.get_embeddings([text])
-    )
+    embeddings = await asyncio.to_thread(lambda: model.get_embeddings([text]))
     return embeddings[0].values

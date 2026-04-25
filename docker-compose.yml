@@ -52,6 +52,8 @@ services:
       DB_NAME: sketchmind
       DB_USER: postgres
       DB_PASS: localpass
+      JWT_SECRET: ${JWT_SECRET:-sketchmind-dev-secret}
+      GOOGLE_CLIENT_ID: ${GOOGLE_CLIENT_ID}
       GOOGLE_APPLICATION_CREDENTIALS: /gcp/creds.json
     volumes:
       - ${GOOGLE_APPLICATION_CREDENTIALS:-~/.config/gcloud/application_default_credentials.json}:/gcp/creds.json:ro
@@ -65,11 +67,13 @@ services:
     build:
       context: ./services/web
       args:
-        NEXT_PUBLIC_API_URL: http://localhost:8080
+        NEXT_PUBLIC_API_URL: ${NEXT_PUBLIC_API_URL}
+        GOOGLE_CLIENT_ID: ${GOOGLE_CLIENT_ID}
     ports:
       - "3000:3000"
     environment:
-      NEXT_PUBLIC_API_URL: http://localhost:8080
+      NEXT_PUBLIC_API_URL: ${NEXT_PUBLIC_API_URL}
+      GOOGLE_CLIENT_ID: ${GOOGLE_CLIENT_ID}
     depends_on:
       - api
 
