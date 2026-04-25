@@ -1,9 +1,141 @@
+import asyncio
+import json
+import logging
+import os
 import pathlib
-from google.adk.agents import Agent, SequentialAgent, LoopAgent
-from google.adk.tools import exit_loop
+import re
+from typing import AsyncGenerator
+
+from typing_extensions import override
+
+from google.adk.agents import Agent, BaseAgent, SequentialAgent, LoopAgent
+from google.adk.agents.invocation_context import InvocationContext
+from google.adk.events import Event, EventActions
 from google.adk.tools.mcp_tool import McpToolset
 from mcp import StdioServerParameters
 from tools.render_tool import render_manim_video
+
+logger = logging.getLogger("sketchmind-agents")
+
+# Allow flipping models without redeploying. Defaults are tuned for
+# Vertex AI's global endpoint (preview models live there).
+PRO_MODEL = os.getenv("AGENT_PRO_MODEL", "gemini-3.1-pro-preview")
+FLASH_MODEL = os.getenv("AGENT_FLASH_MODEL", "gemini-3-flash-preview")
+
+
+_JSON_FENCE_RE = re.compile(r"^\s*```(?:json)?\s*(.*?)\s*```\s*$", re.DOTALL)
+
+
+def _extract_audio_script(script_raw) -> str:
+    """Pull `full_audio_script` out of the scriptwriter's SCRIPT_JSON state.
+
+    Tolerant of three forms the model commonly produces:
+      1. Already a dict (rare — usually a JSON-string)
+      2. Raw JSON string
+      3. Markdown-fenced JSON like ```json {...} ```
+    Returns "" on any extraction failure so the renderer falls back to a silent
+    video instead of crashing.
+    """
+    if not script_raw:
+        return ""
+    if isinstance(script_raw, dict):
+        return script_raw.get("full_audio_script", "") or ""
+
+    text = str(script_raw).strip()
+    fence_match = _JSON_FENCE_RE.match(text)
+    if fence_match:
+        text = fence_match.group(1).strip()
+
+    try:
+        parsed = json.loads(text)
+    except json.JSONDecodeError:
+        # Last resort: find the first {...} block in the string.
+        first_brace = text.find("{")
+        last_brace = text.rfind("}")
+        if first_brace != -1 and last_brace > first_brace:
+            try:
+                parsed = json.loads(text[first_brace : last_brace + 1])
+            except json.JSONDecodeError:
+                return ""
+        else:
+            return ""
+
+    if isinstance(parsed, dict):
+        return parsed.get("full_audio_script", "") or ""
+    return ""
+
+
+class RenderAgent(BaseAgent):
+    """Deterministic render step. Replaces the LLM-wrapped renderer agent.
+
+    Reads MANIM_CODE and SCRIPT_JSON from state, calls render_manim_video,
+    writes VIDEO_URL on success (and escalates the LoopAgent) or RENDER_ERROR
+    on failure (and lets the LoopAgent move on to the fixer).
+    """
+
+    @staticmethod
+    def _extract_audio_script(script_raw) -> str:
+        return _extract_audio_script(script_raw)
+
+    @override
+    async def _run_async_impl(
+        self, ctx: InvocationContext
+    ) -> AsyncGenerator[Event, None]:
+        state = ctx.session.state
+        manim_code = state.get("MANIM_CODE", "")
+        script_raw = state.get("SCRIPT_JSON", "")
+
+        audio_script = self._extract_audio_script(script_raw)
+        if not audio_script:
+            # Audio is critical for the educational format. Log loudly so we notice
+            # when scriptwriter output is malformed or missing the expected field.
+            logger.warning(
+                "[RenderAgent] No audio_script extracted — video will be silent. "
+                "SCRIPT_JSON head: %s",
+                str(script_raw)[:200] if script_raw else "(empty)",
+            )
+
+        if not manim_code:
+            state["RENDER_ERROR"] = "MANIM_CODE missing from session state"
+            yield Event(
+                invocation_id=ctx.invocation_id,
+                author=self.name,
+                actions=EventActions(
+                    state_delta={"RENDER_ERROR": state["RENDER_ERROR"]}
+                ),
+            )
+            return
+
+        # render_manim_video is sync (uses httpx.post). Off-thread it so the
+        # event loop stays responsive — a single render is 30-240s.
+        result = await asyncio.to_thread(render_manim_video, manim_code, audio_script)
+
+        if result.get("status") == "success" and result.get("video_url"):
+            video_url = result["video_url"]
+            state["VIDEO_URL"] = video_url
+            state["RENDER_ERROR"] = ""
+            logger.info(f"[RenderAgent] success → {video_url}")
+            yield Event(
+                invocation_id=ctx.invocation_id,
+                author=self.name,
+                actions=EventActions(
+                    state_delta={"VIDEO_URL": video_url, "RENDER_ERROR": ""},
+                    escalate=True,
+                ),
+            )
+            return
+
+        # Failure path — surface the error for the fixer.
+        err = result.get("error", "Unknown render error")
+        # Truncate so the fixer's prompt doesn't blow up token budget.
+        err_short = err[-1500:] if len(err) > 1500 else err
+        state["RENDER_ERROR"] = err_short
+        logger.info(f"[RenderAgent] failure → {err_short[:200]}")
+        yield Event(
+            invocation_id=ctx.invocation_id,
+            author=self.name,
+            actions=EventActions(state_delta={"RENDER_ERROR": err_short}),
+        )
 
 # Path to the MCP server script
 _MCP_SERVER_PATH = str(pathlib.Path(__file__).parent / "mcp_servers" / "manim_api_server.py")
@@ -26,7 +158,7 @@ async def create_agents():
     # 1. THE RESEARCHER: Breaks broad topics into focused JSON curriculums.
     researcher = Agent(
         name="researcher",
-        model="gemini-2.5-flash",
+        model=FLASH_MODEL,
         description="Researches a broad topic and breaks it down into structured subtopics.",
         instruction="""You are a technical curriculum architect. Your job is to take a user's topic and break it down into a logical progression of highly focused subtopics suitable for 60-90 second educational videos.
 
@@ -50,7 +182,7 @@ async def create_agents():
     # 2. THE SCRIPTWRITER: Translates a single subtopic into a continuous timeline.
     scriptwriter = Agent(
         name="scriptwriter",
-        model="gemini-2.5-flash",
+        model=FLASH_MODEL,
         description="Creates a precise, continuous Manim storyboard script from a subtopic brief.",
         instruction="""You are a technical video scriptwriter and director for animated educational videos.
     Translate the provided research brief into a visual-first storyboard.
@@ -110,7 +242,7 @@ async def create_agents():
     # 3. THE GENERATOR: Writes initial Manim code — uses MCP tools for API reference.
     manim_generator = Agent(
         name="manim_generator",
-        model="gemini-2.5-flash",
+        model=PRO_MODEL,
         description="Generates initial Manim Python code from a script.",
         instruction="""You are an expert Manim Community Edition (v0.20.1) developer.
     Your job is to translate a storyboard script into a precise Manim animation.
@@ -181,7 +313,7 @@ async def create_agents():
     # 4. THE FIXER: Triggers on render failure — uses MCP tools to verify fixes.
     manim_fixer = Agent(
         name="manim_fixer",
-        model="gemini-2.5-flash",
+        model=PRO_MODEL,
         description="Debugs, holistically reviews, and fixes failed Manim Python code.",
         instruction="""You are an expert Manim Community Edition (v0.20.1) debugging specialist.
     The previous render failed. Your job is to fix the code, verify EVERY class and method, and ensure it is flawless.
@@ -230,33 +362,23 @@ async def create_agents():
         output_key="MANIM_CODE",
     )
 
-    # Renderer agent: calls render tool, exits loop on success
-    renderer_agent = Agent(
+    # Deterministic renderer step. Replaces the previous flash LLM wrapper which
+    # was both slow (100-450s of LLM thinking around a single tool call) and
+    # losing video URLs on success (exit_loop produced no output, so the
+    # function_response never reached the parent runner).
+    renderer_agent = RenderAgent(
         name="renderer",
-        model="gemini-2.5-flash",
-        description="Renders Manim code into video.",
-        instruction="""Call render_manim_video with the Manim code and the audio narration script.
-
-    Code: {MANIM_CODE?}
-    Script JSON: {SCRIPT_JSON?}
-
-    IMPORTANT RULES:
-    1. Parse the Script JSON above to extract the "full_audio_script" field.
-    2. Call render_manim_video exactly ONCE with both python_code and audio_script parameters.
-    3. If the result status is 'success', call exit_loop tool immediately.
-    4. If the result status is 'error', just output the error message as plain text.
-       Do NOT call render_manim_video again. Do NOT call exit_loop.
-       Just output the error so the fixer can fix it in the next iteration.""",
-        tools=[render_manim_video, exit_loop],
-        output_key="RENDER_ERROR",
+        description="Renders Manim code into video and writes VIDEO_URL on success.",
     )
 
-    # Loop: render → if error, fixer rewrites MANIM_CODE → re-render (max 5 iterations)
+    # Loop: render → if error, fixer rewrites MANIM_CODE → re-render.
+    # max_iterations=3 paired with the stronger pro model — caps worst-case at ~12 min
+    # instead of ~25 min and avoids the long failed-cascade behavior seen in logs.
     render_and_fix_loop = LoopAgent(
         name="render_and_fix_loop",
         description="Renders Manim code and retries with fixer agent on errors.",
         sub_agents=[renderer_agent, manim_fixer],
-        max_iterations=5,
+        max_iterations=3,
     )
 
     # Subtopic pipeline: processes a single subtopic end-to-end.

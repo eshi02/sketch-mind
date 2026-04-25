@@ -1,6 +1,6 @@
 """Agent service: research endpoint + streaming subtopic endpoint."""
 import json, re, logging, time
-from google.adk.tools.mcp_tool import McpToolset
+from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
@@ -17,7 +17,29 @@ logging.getLogger("google_adk").setLevel(logging.WARNING)
 logging.getLogger("google_genai").setLevel(logging.WARNING)
 logging.getLogger("httpx").setLevel(logging.WARNING)
 
-app = FastAPI(title="SketchMind Agents")
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """Build agents and MCP toolset once at startup, reuse for every request.
+
+    Previously each /research and /process-subtopic call spawned its own MCP
+    subprocess (~1-2s setup tax) and re-loaded the Manim API tools. With pooling,
+    every request reads agent + toolset from app.state. Saves the spawn cost on
+    every call and keeps the lru_cache in manim_api_server.py warm across all
+    subtopics that hit the same agents instance.
+    """
+    researcher, subtopic_pipeline, mcp_toolset = await create_agents()
+    app.state.researcher = researcher
+    app.state.subtopic_pipeline = subtopic_pipeline
+    app.state.mcp_toolset = mcp_toolset
+    logger.info("Agents service warmed up: MCP toolset and agent graph ready")
+    try:
+        yield
+    finally:
+        await mcp_toolset.close()
+
+
+app = FastAPI(title="SketchMind Agents", lifespan=lifespan)
 
 # Map ADK agent names to user-friendly stage descriptions
 AGENT_STAGES = {
@@ -48,49 +70,46 @@ class ResearchRequest(BaseModel):
 @app.post("/research")
 async def research(req: ResearchRequest):
     """Run the researcher agent and return parsed subtopics."""
-    researcher, _, mcp_toolset = await create_agents()
+    researcher = app.state.researcher
+    session_service = InMemorySessionService()
+    runner = Runner(
+        agent=researcher, app_name="sketchmind", session_service=session_service
+    )
+    session = await session_service.create_session(
+        app_name="sketchmind", user_id="user"
+    )
+
+    logger.info(f"Research: topic={req.topic}")
+    t0 = time.time()
+    async for _ in runner.run_async(
+        user_id="user",
+        session_id=session.id,
+        new_message=types.Content(
+            role="user",
+            parts=[types.Part.from_text(
+                text=f"Create an educational video explaining: {req.topic}"
+            )],
+        ),
+    ):
+        pass
+    logger.info(f"Research completed in {time.time() - t0:.1f}s")
+
+    state = (await session_service.get_session(
+        app_name="sketchmind", user_id="user", session_id=session.id
+    )).state
+    raw = state.get("CURRICULUM_JSON", "[]")
+    logger.info(f"CURRICULUM_JSON: {str(raw)[:500]}")
+
     try:
-        session_service = InMemorySessionService()
-        runner = Runner(
-            agent=researcher, app_name="sketchmind", session_service=session_service
-        )
-        session = await session_service.create_session(
-            app_name="sketchmind", user_id="user"
-        )
+        subtopics = json.loads(raw) if isinstance(raw, str) else raw
+    except json.JSONDecodeError:
+        m = re.search(r'\[.*\]', str(raw), re.DOTALL)
+        subtopics = json.loads(m.group(0)) if m else []
 
-        logger.info(f"Research: topic={req.topic}")
-        t0 = time.time()
-        async for _ in runner.run_async(
-            user_id="user",
-            session_id=session.id,
-            new_message=types.Content(
-                role="user",
-                parts=[types.Part.from_text(
-                    text=f"Create an educational video explaining: {req.topic}"
-                )],
-            ),
-        ):
-            pass
-        logger.info(f"Research completed in {time.time() - t0:.1f}s")
+    if not isinstance(subtopics, list) or len(subtopics) == 0:
+        return {"status": "error", "error": "No subtopics generated", "subtopics": []}
 
-        state = (await session_service.get_session(
-            app_name="sketchmind", user_id="user", session_id=session.id
-        )).state
-        raw = state.get("CURRICULUM_JSON", "[]")
-        logger.info(f"CURRICULUM_JSON: {str(raw)[:500]}")
-
-        try:
-            subtopics = json.loads(raw) if isinstance(raw, str) else raw
-        except json.JSONDecodeError:
-            m = re.search(r'\[.*\]', str(raw), re.DOTALL)
-            subtopics = json.loads(m.group(0)) if m else []
-
-        if not isinstance(subtopics, list) or len(subtopics) == 0:
-            return {"status": "error", "error": "No subtopics generated", "subtopics": []}
-
-        return {"status": "ok", "subtopics": subtopics}
-    finally:
-        await mcp_toolset.close()
+    return {"status": "ok", "subtopics": subtopics}
 
 
 # ---------------------------------------------------------------------------
@@ -112,9 +131,9 @@ async def process_subtopic(req: SubtopicRequest):
         # Emit initial stage
         yield json.dumps({"stage": "starting", "message": f"Processing: {title}"}) + "\n"
 
-        # Each subtopic gets its own agents + MCP subprocess to avoid
-        # shared-state and stdio-pipe contention between concurrent runs.
-        _, subtopic_pipeline, mcp_toolset = await create_agents()
+        # Reuse the agent + MCP toolset built once at startup. ADK Agents are
+        # stateless config; per-request runtime state lives in InvocationContext.
+        subtopic_pipeline = app.state.subtopic_pipeline
         try:
             session_service = InMemorySessionService()
             runner = Runner(
@@ -168,12 +187,17 @@ async def process_subtopic(req: SubtopicRequest):
                 state = (await session_service.get_session(
                     app_name="sketchmind", user_id="user", session_id=session.id
                 )).state
-                for key in ["RENDER_ERROR", "RENDER_RESULT"]:
-                    val = state.get(key, "")
-                    if val:
-                        video_url = _extract_video_url(str(val))
-                        if video_url:
-                            break
+                # VIDEO_URL is set directly by the deterministic RenderAgent on success.
+                direct = state.get("VIDEO_URL")
+                if direct:
+                    video_url = str(direct)
+                if not video_url:
+                    for key in ["RENDER_ERROR", "RENDER_RESULT"]:
+                        val = state.get(key, "")
+                        if val:
+                            video_url = _extract_video_url(str(val))
+                            if video_url:
+                                break
                 if not video_url and final_text:
                     video_url = _extract_video_url(final_text)
 
@@ -200,8 +224,6 @@ async def process_subtopic(req: SubtopicRequest):
                 "index": req.index,
                 "error": str(e),
             }) + "\n"
-        finally:
-            await mcp_toolset.close()
 
     return StreamingResponse(event_stream(), media_type="application/x-ndjson")
 

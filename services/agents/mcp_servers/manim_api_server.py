@@ -8,6 +8,7 @@ three tools for agents to look up correct function signatures.
 import asyncio
 import json
 import pathlib
+from functools import lru_cache
 
 from mcp.server import Server
 from mcp.server.stdio import stdio_server
@@ -154,73 +155,90 @@ async def list_tools() -> list[Tool]:
     ]
 
 
+# ---------------------------------------------------------------------------
+# Tool result cache. The underlying API DATA is read-only at module load, so
+# every (tool, args) pair always produces the same output. The previous
+# pipeline took 40-163s in manim_generator largely from sequential MCP
+# roundtrips re-deriving the same answers. Caching brings warm-cache hits
+# to ~0ms and persists for the lifetime of the MCP subprocess (one per
+# subtopic in the current topology).
+# ---------------------------------------------------------------------------
+
+
+@lru_cache(maxsize=512)
+def _lookup_class_text(class_name: str) -> str:
+    key = class_name.lower()
+
+    entry = BY_NAME.get(key)
+
+    # Fuzzy: try partial match
+    if not entry:
+        for k, e in BY_NAME.items():
+            if key in k:
+                entry = e
+                break
+
+    if not entry:
+        return (
+            f"No ManimCE class or function found matching '{class_name}'. "
+            f"Try search_manim_api to find similar classes."
+        )
+    return _format_entry(entry)
+
+
+@lru_cache(maxsize=512)
+def _search_text(query: str) -> str:
+    tokens = query.split()
+
+    scored = [(entry, _search_score(tokens, entry)) for entry in DATA]
+    scored = [(e, s) for e, s in scored if s > 0]
+    scored.sort(key=lambda x: x[1], reverse=True)
+    top = scored[:5]
+
+    if not top:
+        return f"No results found for '{query}'. Try different keywords."
+
+    results = []
+    for entry, _ in top:
+        sig = entry.get("signature", "")
+        doc = entry.get("docstring", "")[:100]
+        results.append(
+            f"- {entry['name']}{sig}  [{entry['module']}]\n  {doc}"
+        )
+    return "\n\n".join(results)
+
+
+@lru_cache(maxsize=1)
+def _list_animations_text() -> str:
+    lines = ["# Available ManimCE Animation Classes\n"]
+    by_module: dict[str, list[dict]] = {}
+    for anim in ANIMATIONS:
+        mod = anim["module"]
+        by_module.setdefault(mod, []).append(anim)
+
+    for mod in sorted(by_module.keys()):
+        lines.append(f"\n## {mod}")
+        for a in sorted(by_module[mod], key=lambda x: x["name"]):
+            sig = a.get("signature", "()")
+            doc = a.get("docstring", "")[:80]
+            lines.append(f"  {a['name']}{sig}")
+            if doc:
+                lines.append(f"    # {doc}")
+    return "\n".join(lines)
+
+
 @app.call_tool()
 async def call_tool(name: str, arguments: dict) -> list[TextContent]:
     if name == "lookup_manim_class":
         class_name = arguments.get("class_name", "").strip()
-        key = class_name.lower()
-
-        # Exact match
-        entry = BY_NAME.get(key)
-
-        # Fuzzy: try partial match
-        if not entry:
-            candidates = [e for k, e in BY_NAME.items() if key in k]
-            if candidates:
-                entry = candidates[0]
-
-        if not entry:
-            return [TextContent(
-                type="text",
-                text=f"No ManimCE class or function found matching '{class_name}'. "
-                     f"Try search_manim_api to find similar classes.",
-            )]
-
-        return [TextContent(type="text", text=_format_entry(entry))]
+        return [TextContent(type="text", text=_lookup_class_text(class_name))]
 
     elif name == "search_manim_api":
         query = arguments.get("query", "").strip().lower()
-        tokens = query.split()
-
-        scored = [(entry, _search_score(tokens, entry)) for entry in DATA]
-        scored = [(e, s) for e, s in scored if s > 0]
-        scored.sort(key=lambda x: x[1], reverse=True)
-        top = scored[:5]
-
-        if not top:
-            return [TextContent(
-                type="text",
-                text=f"No results found for '{query}'. Try different keywords.",
-            )]
-
-        results = []
-        for entry, score in top:
-            sig = entry.get("signature", "")
-            doc = entry.get("docstring", "")[:100]
-            results.append(
-                f"- {entry['name']}{sig}  [{entry['module']}]\n  {doc}"
-            )
-
-        return [TextContent(type="text", text="\n\n".join(results))]
+        return [TextContent(type="text", text=_search_text(query))]
 
     elif name == "list_manim_animations":
-        lines = ["# Available ManimCE Animation Classes\n"]
-        # Group by module
-        by_module: dict[str, list[dict]] = {}
-        for anim in ANIMATIONS:
-            mod = anim["module"]
-            by_module.setdefault(mod, []).append(anim)
-
-        for mod in sorted(by_module.keys()):
-            lines.append(f"\n## {mod}")
-            for a in sorted(by_module[mod], key=lambda x: x["name"]):
-                sig = a.get("signature", "()")
-                doc = a.get("docstring", "")[:80]
-                lines.append(f"  {a['name']}{sig}")
-                if doc:
-                    lines.append(f"    # {doc}")
-
-        return [TextContent(type="text", text="\n".join(lines))]
+        return [TextContent(type="text", text=_list_animations_text())]
 
     return [TextContent(type="text", text=f"Unknown tool: {name}")]
 

@@ -97,7 +97,14 @@ def _get_duration(file_path: str) -> float | None:
 
 
 def _merge_with_sync(video_path: str, audio_path: str, output_path: str) -> bool:
-    """Merge video and audio, scaling video speed to match audio duration."""
+    """Merge video and audio. Preserves all audio content — never truncates narration.
+
+    - Within 0.8-1.2 ratio: gently retime the video to match audio length (existing behavior).
+    - Audio longer than video (ratio > 1.2): hold the last video frame via tpad so the
+      narrator finishes the sentence over a still image instead of getting cut off.
+    - Video longer than audio (ratio < 0.8): -shortest is acceptable here because we lose
+      only trailing visual padding, not narration.
+    """
     try:
         video_dur = _get_duration(video_path)
         audio_dur = _get_duration(audio_path)
@@ -116,9 +123,20 @@ def _merge_with_sync(video_path: str, audio_path: str, output_path: str) -> bool
                 "-c:a", "aac", "-map", "0:v", "-map", "1:a",
                 "-y", output_path,
             ]
+        elif ratio > 1.2:
+            # Audio is meaningfully longer than video — extend video by holding the
+            # last frame for the remaining audio duration so we don't truncate narration.
+            pad_seconds = audio_dur - video_dur
+            logger.info("Audio longer than video by %.1fs — holding last frame", pad_seconds)
+            cmd = [
+                "ffmpeg", "-i", video_path, "-i", audio_path,
+                "-filter:v", f"tpad=stop_mode=clone:stop_duration={pad_seconds:.3f}",
+                "-c:a", "aac", "-map", "0:v", "-map", "1:a",
+                "-y", output_path,
+            ]
         else:
-            # Durations too different — use shortest to avoid bad pacing
-            logger.warning("Duration ratio %.2f outside 0.8-1.2 range, using -shortest", ratio)
+            # Video meaningfully longer than audio — trim trailing visual padding.
+            logger.info("Video longer than audio (ratio=%.2f) — using -shortest", ratio)
             cmd = [
                 "ffmpeg", "-i", video_path, "-i", audio_path,
                 "-c:v", "copy", "-c:a", "aac",
@@ -135,55 +153,88 @@ def _merge_with_sync(video_path: str, audio_path: str, output_path: str) -> bool
         return False
 
 
-def _render_sync(req_python_code: str, req_scene_class_name: str,
-                  req_quality: str, req_audio_script: str | None) -> dict:
-    """All blocking work runs here — called from a thread pool."""
-    start = time.time()
-    rid = uuid.uuid4().hex[:8]
-    work_dir = tempfile.mkdtemp(prefix=f"m_{rid}_")
+def _tts_step(rid: str, work_dir: str, audio_script: str) -> str | None:
+    """Synthesize narration. Returns mp3 path on success, None on failure."""
+    t1 = time.time()
+    audio_path = os.path.join(work_dir, "narration.mp3")
+    ok = _synthesize_speech(audio_script, audio_path)
+    logger.info("[%s] TTS: %.1fs (%s)", rid, time.time() - t1, "ok" if ok else "failed")
+    return audio_path if ok else None
+
+
+def _manim_step(rid: str, work_dir: str, python_code: str,
+                scene_class_name: str, quality: str) -> tuple[str | None, str | None]:
+    """Render the Manim scene. Returns (silent_video_path, error). On success, error is None."""
+    t2 = time.time()
+    scene_file = os.path.join(work_dir, "scene.py")
+    with open(scene_file, "w") as f:
+        f.write(python_code)
 
     try:
-        # Step 1: If audio script provided, synthesize speech first
-        audio_path = None
-        if req_audio_script:
-            t1 = time.time()
-            audio_path = os.path.join(work_dir, "narration.mp3")
-            tts_ok = _synthesize_speech(req_audio_script, audio_path)
-            logger.info("[%s] TTS: %.1fs (%s)", rid, time.time() - t1, "ok" if tts_ok else "failed")
-            if not tts_ok:
-                audio_path = None  # fall back to silent video
-
-        # Step 2: Render Manim video
-        t2 = time.time()
-        scene_file = os.path.join(work_dir, "scene.py")
-        with open(scene_file, "w") as f:
-            f.write(req_python_code)
-
         result = subprocess.run(
-            ["python3", "-m", "manim", "render", f"-q{req_quality}",
-             "--media_dir", work_dir, scene_file, req_scene_class_name],
+            ["python3", "-m", "manim", "render", f"-q{quality}",
+             "--media_dir", work_dir, scene_file, scene_class_name],
             capture_output=True, text=True, timeout=240, cwd=work_dir,
         )
-        logger.info("[%s] Manim render: %.1fs (exit=%d)", rid, time.time() - t2, result.returncode)
+    except subprocess.TimeoutExpired:
+        logger.info("[%s] Manim render: TIMEOUT after >240s", rid)
+        return None, "Render timed out (>4 min)"
 
-        if result.returncode != 0:
-            return {"status": "error", "error": result.stderr[-1500:]}
+    logger.info("[%s] Manim render: %.1fs (exit=%d)", rid, time.time() - t2, result.returncode)
+    if result.returncode != 0:
+        return None, result.stderr[-1500:]
 
-        qmap = {"l": "480p15", "m": "720p30", "h": "1080p60"}
-        vdir = os.path.join(work_dir, "videos", "scene", qmap.get(req_quality, "720p30"))
+    qmap = {"l": "480p15", "m": "720p30", "h": "1080p60"}
+    vdir = os.path.join(work_dir, "videos", "scene", qmap.get(quality, "720p30"))
+    try:
         vfiles = [f for f in os.listdir(vdir) if f.endswith(".mp4")]
-        if not vfiles:
-            return {"status": "error", "error": "No .mp4 produced"}
+    except FileNotFoundError:
+        return None, "No .mp4 produced"
+    if not vfiles:
+        return None, "No .mp4 produced"
+    return os.path.join(vdir, vfiles[0]), None
 
-        silent_video = os.path.join(vdir, vfiles[0])
+
+@app.post("/render")
+async def render_video(req: RenderRequest):
+    """Async orchestrator: TTS and Manim run concurrently, then merge + upload.
+
+    TTS is network-bound (gRPC to Google TTS) and Manim is CPU-bound — they're
+    independent until the merge step, so running both in parallel saves the
+    full TTS duration (~5-15s) per render.
+    """
+    rid = uuid.uuid4().hex[:8]
+    work_dir = tempfile.mkdtemp(prefix=f"m_{rid}_")
+    start = time.time()
+    loop = asyncio.get_event_loop()
+
+    try:
+        manim_task = loop.run_in_executor(
+            None, _manim_step, rid, work_dir, req.python_code,
+            req.scene_class_name, req.quality,
+        )
+        if req.audio_script:
+            tts_task = loop.run_in_executor(
+                None, _tts_step, rid, work_dir, req.audio_script,
+            )
+            audio_path, (silent_video, manim_err) = await asyncio.gather(tts_task, manim_task)
+        else:
+            audio_path = None
+            silent_video, manim_err = await manim_task
+
+        if manim_err:
+            return {"status": "error", "error": manim_err}
+
         upload_path = silent_video
         has_audio = False
 
-        # Step 3: Merge audio with video if TTS succeeded
+        # Merge audio with video if TTS succeeded
         if audio_path:
             t3 = time.time()
             final_video = os.path.join(work_dir, "final.mp4")
-            merge_ok = _merge_with_sync(silent_video, audio_path, final_video)
+            merge_ok = await loop.run_in_executor(
+                None, _merge_with_sync, silent_video, audio_path, final_video,
+            )
             logger.info("[%s] FFmpeg merge: %.1fs (%s)", rid, time.time() - t3, "ok" if merge_ok else "failed")
             if merge_ok:
                 upload_path = final_video
@@ -191,36 +242,32 @@ def _render_sync(req_python_code: str, req_scene_class_name: str,
             else:
                 logger.warning("Audio merge failed, uploading silent video")
 
-        # Step 4: Upload to GCS
+        # Upload to GCS (off-thread; google-cloud-storage is blocking)
         t4 = time.time()
-        client = storage.Client(project=os.getenv("GOOGLE_CLOUD_PROJECT"))
-        blob = client.bucket(GCS_BUCKET).blob(f"videos/{rid}_{req_scene_class_name}.mp4")
-        blob.upload_from_filename(upload_path, content_type="video/mp4")
-        blob.make_public()
+        def _upload() -> str:
+            client = storage.Client(project=os.getenv("GOOGLE_CLOUD_PROJECT"))
+            blob = client.bucket(GCS_BUCKET).blob(
+                f"videos/{rid}_{req.scene_class_name}.mp4"
+            )
+            blob.upload_from_filename(upload_path, content_type="video/mp4")
+            blob.make_public()
+            return blob.public_url
+
+        public_url = await loop.run_in_executor(None, _upload)
         logger.info("[%s] GCS upload: %.1fs", rid, time.time() - t4)
 
         total = round(time.time() - start, 1)
         logger.info("[%s] Total render: %.1fs (audio=%s)", rid, total, has_audio)
-        return {"status": "success", "video_url": blob.public_url,
+        return {"status": "success", "video_url": public_url,
                 "has_audio": has_audio,
                 "render_time": total}
 
-    except subprocess.TimeoutExpired:
-        return {"status": "error", "error": "Render timed out (>4 min)"}
     except Exception as e:
         return {"status": "error", "error": str(e)}
     finally:
-        subprocess.run(["rm", "-rf", work_dir], capture_output=True)
-
-
-@app.post("/render")
-async def render_video(req: RenderRequest):
-    loop = asyncio.get_event_loop()
-    return await loop.run_in_executor(
-        None,
-        partial(_render_sync, req.python_code, req.scene_class_name,
-                req.quality, req.audio_script),
-    )
+        await loop.run_in_executor(
+            None, partial(subprocess.run, ["rm", "-rf", work_dir], capture_output=True),
+        )
 
 
 @app.get("/health")

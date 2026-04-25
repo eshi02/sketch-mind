@@ -69,8 +69,8 @@ echo ">>> Renderer..."
 gcloud builds submit services/renderer --tag "$REGISTRY/renderer" --timeout=1200
 gcloud run deploy sketchmind-renderer \
     --image="$REGISTRY/renderer" --region="$REGION" \
-    --cpu=2 --memory=2Gi --timeout=300 \
-    --concurrency=1 --min-instances=1 --max-instances=5 \
+    --cpu=2 --memory=2Gi --timeout=360 \
+    --concurrency=1 --min-instances=1 --max-instances=8 \
     --set-env-vars="GCS_BUCKET=${PROJECT_ID}-sketchmind-videos" \
     --no-allow-unauthenticated
 
@@ -82,9 +82,9 @@ echo ">>> Agents..."
 gcloud builds submit services/agents --tag "$REGISTRY/agents"
 gcloud run deploy sketchmind-agents \
     --image="$REGISTRY/agents" --region="$REGION" \
-    --cpu=1 --memory=512Mi --timeout=300 \
-    --min-instances=1 --max-instances=3 \
-    --set-env-vars="RENDER_SERVICE_URL=$RENDER_URL,GOOGLE_CLOUD_PROJECT=$PROJECT_ID,GOOGLE_CLOUD_LOCATION=$REGION,GOOGLE_GENAI_USE_VERTEXAI=true" \
+    --cpu=1 --memory=1Gi --timeout=300 \
+    --min-instances=1 --max-instances=10 \
+    --set-env-vars="RENDER_SERVICE_URL=$RENDER_URL,GOOGLE_CLOUD_PROJECT=$PROJECT_ID,GOOGLE_CLOUD_LOCATION=global,GOOGLE_GENAI_USE_VERTEXAI=true,AGENT_PRO_MODEL=${AGENT_PRO_MODEL:-gemini-3.1-pro-preview},AGENT_FLASH_MODEL=${AGENT_FLASH_MODEL:-gemini-2.5-flash}" \
     --no-allow-unauthenticated
 
 AGENTS_URL=$(gcloud run services describe sketchmind-agents \
