@@ -67,10 +67,10 @@ def _calc_speaking_rate(audio_script: str, target_duration: float) -> float:
     if target_duration <= 0 or baseline_duration <= 0:
         return BASE_RATE
     ideal_rate = BASE_RATE * (baseline_duration / target_duration)
-    # Cap at 1.3× so the voice stays natural and understandable for
-    # educational content.  If the narration is too long for the video
-    # the merge step's fallback (setpts / tpad) handles the remainder.
-    clamped = max(0.7, min(1.3, ideal_rate))
+    # Cap at 1.0× so the voice stays at natural speed.
+    # If the narration is too long for the video, the merge step's
+    # fallback (setpts / tpad) handles the remainder.
+    clamped = max(0.7, min(1.0, ideal_rate))
     logger.info(
         "Calculated speaking_rate=%.2f for target_duration=%.1fs "
         "(words=%d, baseline=%.1fs, ideal=%.2f)",
@@ -124,16 +124,10 @@ def _get_duration(file_path: str) -> float | None:
 
 
 def _merge_with_sync(video_path: str, audio_path: str, output_path: str) -> bool:
-    """Merge video and audio with duration-aware strategy.
+    """Merge video and audio by stretching video to match audio duration.
 
-    With the video-first approach the TTS speaking_rate is already tuned so
-    audio ≈ video duration.  The three branches below are safety nets:
-
-    - 0.9-1.1 ratio  → straight copy-merge (no re-encoding of video)
-    - 1.1-2.0 ratio  → gently retime video via setpts so visuals stretch to
-                        match the slightly-longer audio
-    - 0.5-0.9 ratio  → trim trailing visual padding with -shortest
-    - outside 0.5-2.0 → last-resort: tpad (hold last frame) or -shortest
+    The video is retimed via setpts so it plays for exactly the same duration
+    as the audio track, keeping narration and visuals in sync.
     """
     try:
         video_dur = _get_duration(video_path)
@@ -145,42 +139,22 @@ def _merge_with_sync(video_path: str, audio_path: str, output_path: str) -> bool
         logger.info("Duration sync: video=%.1fs, audio=%.1fs, ratio=%.3f",
                      video_dur, audio_dur, ratio)
 
-        if 0.9 <= ratio <= 1.1:
-            # Durations match well — straight merge, no video re-encoding
-            logger.info("Durations match (ratio=%.2f) — straight merge", ratio)
+        if 0.95 <= ratio <= 1.05:
+            # Durations already match — straight copy, no re-encoding
             cmd = [
                 "ffmpeg", "-i", video_path, "-i", audio_path,
                 "-c:v", "copy", "-c:a", "aac",
                 "-map", "0:v", "-map", "1:a",
                 "-y", output_path,
             ]
-        elif 1.1 < ratio <= 2.0:
-            # Audio slightly longer — retime video to match
-            logger.info("Audio slightly longer (ratio=%.2f) — retiming video", ratio)
+        else:
+            # Stretch/compress video to match audio duration
+            logger.info("Retiming video by %.2fx to match audio", ratio)
             cmd = [
                 "ffmpeg", "-i", video_path, "-i", audio_path,
                 "-filter:v", f"setpts=PTS*{ratio}",
                 "-c:a", "aac", "-map", "0:v", "-map", "1:a",
                 "-y", output_path,
-            ]
-        elif ratio > 2.0:
-            # Audio much longer (rate-clamping couldn't fully compensate) —
-            # hold last video frame so narration finishes.
-            pad_seconds = audio_dur - video_dur
-            logger.warning("Audio much longer than video by %.1fs — holding last frame", pad_seconds)
-            cmd = [
-                "ffmpeg", "-i", video_path, "-i", audio_path,
-                "-filter:v", f"tpad=stop_mode=clone:stop_duration={pad_seconds:.3f}",
-                "-c:a", "aac", "-map", "0:v", "-map", "1:a",
-                "-y", output_path,
-            ]
-        else:
-            # Video longer than audio — trim trailing visual padding
-            logger.info("Video longer than audio (ratio=%.2f) — using -shortest", ratio)
-            cmd = [
-                "ffmpeg", "-i", video_path, "-i", audio_path,
-                "-c:v", "copy", "-c:a", "aac",
-                "-shortest", "-y", output_path,
             ]
 
         result = subprocess.run(cmd, capture_output=True, text=True, timeout=120)

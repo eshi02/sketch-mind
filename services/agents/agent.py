@@ -281,7 +281,7 @@ async def create_agents():
     [ ] Scene cleared with self.play(FadeOut(*self.mobjects)) between visual sections
     [ ] Max 5 elements visible on screen at any time
     [ ] Text elements are 1-5 words max, font_size=36 or smaller (48 for titles only)
-    [ ] self.wait(1) after major animation blocks
+    [ ] self.wait(2) after major animation blocks, self.wait(3) at scene end
     [ ] All imports are correct and present
 
     === PHASE 3: SIMPLIFY IF NEEDED ===

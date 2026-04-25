@@ -101,11 +101,21 @@ async def research(req: ResearchRequest):
     raw = state.get("CURRICULUM_JSON", "[]")
     logger.info(f"CURRICULUM_JSON: {str(raw)[:500]}")
 
+    def _fix_json(s: str) -> list:
+        """Parse JSON, fixing invalid LaTeX backslash escapes the LLM produces."""
+        # Replace lone backslashes (not valid JSON escapes) with double-backslash.
+        # Valid JSON escapes: \", \\, \/, \b, \f, \n, \r, \t, \uXXXX
+        fixed = re.sub(r'\\(?!["\\/bfnrtu])', r'\\\\', s)
+        return json.loads(fixed)
+
     try:
-        subtopics = json.loads(raw) if isinstance(raw, str) else raw
+        subtopics = _fix_json(raw) if isinstance(raw, str) else raw
     except json.JSONDecodeError:
         m = re.search(r'\[.*\]', str(raw), re.DOTALL)
-        subtopics = json.loads(m.group(0)) if m else []
+        try:
+            subtopics = _fix_json(m.group(0)) if m else []
+        except (json.JSONDecodeError, AttributeError):
+            subtopics = []
 
     if not isinstance(subtopics, list) or len(subtopics) == 0:
         return {"status": "error", "error": "No subtopics generated", "subtopics": []}
