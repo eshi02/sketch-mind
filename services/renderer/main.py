@@ -53,7 +53,34 @@ def _clean_audio_text(text: str) -> str:
     return text
 
 
-def _synthesize_speech(text: str, output_path: str) -> bool:
+def _calc_speaking_rate(audio_script: str, target_duration: float) -> float:
+    """Calculate TTS speaking_rate so narration fits the video's target_duration.
+
+    Uses a words-per-second heuristic calibrated against Google TTS Journey
+    voice at the base rate of 0.95.  The returned rate is clamped to
+    Google TTS limits [0.25, 4.0].
+    """
+    BASE_RATE = 0.95
+    WPS_AT_BASE = 2.5  # words/sec at speaking_rate=0.95 (empirically measured)
+    word_count = len(audio_script.split())
+    baseline_duration = word_count / WPS_AT_BASE  # estimated duration at base rate
+    if target_duration <= 0 or baseline_duration <= 0:
+        return BASE_RATE
+    ideal_rate = BASE_RATE * (baseline_duration / target_duration)
+    # Cap at 1.3× so the voice stays natural and understandable for
+    # educational content.  If the narration is too long for the video
+    # the merge step's fallback (setpts / tpad) handles the remainder.
+    clamped = max(0.7, min(1.3, ideal_rate))
+    logger.info(
+        "Calculated speaking_rate=%.2f for target_duration=%.1fs "
+        "(words=%d, baseline=%.1fs, ideal=%.2f)",
+        clamped, target_duration, word_count, baseline_duration, ideal_rate,
+    )
+    return clamped
+
+
+def _synthesize_speech(text: str, output_path: str,
+                       speaking_rate: float = 0.95) -> bool:
     """Convert text to speech using Google Cloud TTS Journey voice. Returns True on success."""
     try:
         client = _get_tts_client()
@@ -68,14 +95,14 @@ def _synthesize_speech(text: str, output_path: str) -> bool:
         )
         audio_config = texttospeech.AudioConfig(
             audio_encoding=texttospeech.AudioEncoding.MP3,
-            speaking_rate=0.95,  # slightly slower for educational clarity
+            speaking_rate=speaking_rate,
         )
         response = client.synthesize_speech(
             input=synthesis_input, voice=voice, audio_config=audio_config,
         )
         with open(output_path, "wb") as f:
             f.write(response.audio_content)
-        logger.info("TTS synthesis complete: %s", output_path)
+        logger.info("TTS synthesis complete: %s (rate=%.2f)", output_path, speaking_rate)
         return True
     except Exception as e:
         logger.error("TTS synthesis failed: %s", e)
@@ -97,13 +124,16 @@ def _get_duration(file_path: str) -> float | None:
 
 
 def _merge_with_sync(video_path: str, audio_path: str, output_path: str) -> bool:
-    """Merge video and audio. Preserves all audio content — never truncates narration.
+    """Merge video and audio with duration-aware strategy.
 
-    - Within 0.8-1.2 ratio: gently retime the video to match audio length (existing behavior).
-    - Audio longer than video (ratio > 1.2): hold the last video frame via tpad so the
-      narrator finishes the sentence over a still image instead of getting cut off.
-    - Video longer than audio (ratio < 0.8): -shortest is acceptable here because we lose
-      only trailing visual padding, not narration.
+    With the video-first approach the TTS speaking_rate is already tuned so
+    audio ≈ video duration.  The three branches below are safety nets:
+
+    - 0.9-1.1 ratio  → straight copy-merge (no re-encoding of video)
+    - 1.1-2.0 ratio  → gently retime video via setpts so visuals stretch to
+                        match the slightly-longer audio
+    - 0.5-0.9 ratio  → trim trailing visual padding with -shortest
+    - outside 0.5-2.0 → last-resort: tpad (hold last frame) or -shortest
     """
     try:
         video_dur = _get_duration(video_path)
@@ -115,19 +145,29 @@ def _merge_with_sync(video_path: str, audio_path: str, output_path: str) -> bool
         logger.info("Duration sync: video=%.1fs, audio=%.1fs, ratio=%.3f",
                      video_dur, audio_dur, ratio)
 
-        if 0.8 <= ratio <= 1.2:
-            # Scale video tempo to match audio duration
+        if 0.9 <= ratio <= 1.1:
+            # Durations match well — straight merge, no video re-encoding
+            logger.info("Durations match (ratio=%.2f) — straight merge", ratio)
+            cmd = [
+                "ffmpeg", "-i", video_path, "-i", audio_path,
+                "-c:v", "copy", "-c:a", "aac",
+                "-map", "0:v", "-map", "1:a",
+                "-y", output_path,
+            ]
+        elif 1.1 < ratio <= 2.0:
+            # Audio slightly longer — retime video to match
+            logger.info("Audio slightly longer (ratio=%.2f) — retiming video", ratio)
             cmd = [
                 "ffmpeg", "-i", video_path, "-i", audio_path,
                 "-filter:v", f"setpts=PTS*{ratio}",
                 "-c:a", "aac", "-map", "0:v", "-map", "1:a",
                 "-y", output_path,
             ]
-        elif ratio > 1.2:
-            # Audio is meaningfully longer than video — extend video by holding the
-            # last frame for the remaining audio duration so we don't truncate narration.
+        elif ratio > 2.0:
+            # Audio much longer (rate-clamping couldn't fully compensate) —
+            # hold last video frame so narration finishes.
             pad_seconds = audio_dur - video_dur
-            logger.info("Audio longer than video by %.1fs — holding last frame", pad_seconds)
+            logger.warning("Audio much longer than video by %.1fs — holding last frame", pad_seconds)
             cmd = [
                 "ffmpeg", "-i", video_path, "-i", audio_path,
                 "-filter:v", f"tpad=stop_mode=clone:stop_duration={pad_seconds:.3f}",
@@ -135,7 +175,7 @@ def _merge_with_sync(video_path: str, audio_path: str, output_path: str) -> bool
                 "-y", output_path,
             ]
         else:
-            # Video meaningfully longer than audio — trim trailing visual padding.
+            # Video longer than audio — trim trailing visual padding
             logger.info("Video longer than audio (ratio=%.2f) — using -shortest", ratio)
             cmd = [
                 "ffmpeg", "-i", video_path, "-i", audio_path,
@@ -153,12 +193,14 @@ def _merge_with_sync(video_path: str, audio_path: str, output_path: str) -> bool
         return False
 
 
-def _tts_step(rid: str, work_dir: str, audio_script: str) -> str | None:
-    """Synthesize narration. Returns mp3 path on success, None on failure."""
+def _tts_step(rid: str, work_dir: str, audio_script: str,
+              speaking_rate: float = 0.95) -> str | None:
+    """Synthesize narration at the given rate. Returns mp3 path on success, None on failure."""
     t1 = time.time()
     audio_path = os.path.join(work_dir, "narration.mp3")
-    ok = _synthesize_speech(audio_script, audio_path)
-    logger.info("[%s] TTS: %.1fs (%s)", rid, time.time() - t1, "ok" if ok else "failed")
+    ok = _synthesize_speech(audio_script, audio_path, speaking_rate=speaking_rate)
+    logger.info("[%s] TTS: %.1fs (rate=%.2f, %s)", rid, time.time() - t1,
+                speaking_rate, "ok" if ok else "failed")
     return audio_path if ok else None
 
 
@@ -197,11 +239,12 @@ def _manim_step(rid: str, work_dir: str, python_code: str,
 
 @app.post("/render")
 async def render_video(req: RenderRequest):
-    """Async orchestrator: TTS and Manim run concurrently, then merge + upload.
+    """Video-first orchestrator: render Manim → measure duration → TTS at
+    adjusted rate → merge.
 
-    TTS is network-bound (gRPC to Google TTS) and Manim is CPU-bound — they're
-    independent until the merge step, so running both in parallel saves the
-    full TTS duration (~5-15s) per render.
+    By rendering the video first and adjusting the TTS speaking_rate to match
+    the video's actual duration, the narration and animation stay in sync
+    without post-hoc stretching or freezing.
     """
     rid = uuid.uuid4().hex[:8]
     work_dir = tempfile.mkdtemp(prefix=f"m_{rid}_")
@@ -209,40 +252,47 @@ async def render_video(req: RenderRequest):
     loop = asyncio.get_event_loop()
 
     try:
-        manim_task = loop.run_in_executor(
+        # ── Step 1: Render Manim video ──────────────────────────────────
+        silent_video, manim_err = await loop.run_in_executor(
             None, _manim_step, rid, work_dir, req.python_code,
             req.scene_class_name, req.quality,
         )
-        if req.audio_script:
-            tts_task = loop.run_in_executor(
-                None, _tts_step, rid, work_dir, req.audio_script,
-            )
-            audio_path, (silent_video, manim_err) = await asyncio.gather(tts_task, manim_task)
-        else:
-            audio_path = None
-            silent_video, manim_err = await manim_task
-
         if manim_err:
             return {"status": "error", "error": manim_err}
 
         upload_path = silent_video
         has_audio = False
 
-        # Merge audio with video if TTS succeeded
-        if audio_path:
-            t3 = time.time()
-            final_video = os.path.join(work_dir, "final.mp4")
-            merge_ok = await loop.run_in_executor(
-                None, _merge_with_sync, silent_video, audio_path, final_video,
-            )
-            logger.info("[%s] FFmpeg merge: %.1fs (%s)", rid, time.time() - t3, "ok" if merge_ok else "failed")
-            if merge_ok:
-                upload_path = final_video
-                has_audio = True
+        # ── Step 2: TTS with rate matched to video duration ─────────────
+        if req.audio_script:
+            # Measure the rendered video's actual duration
+            video_dur = await loop.run_in_executor(None, _get_duration, silent_video)
+            if video_dur and video_dur > 0:
+                speaking_rate = _calc_speaking_rate(req.audio_script, video_dur)
             else:
-                logger.warning("Audio merge failed, uploading silent video")
+                speaking_rate = 0.95  # fallback to default
+                logger.warning("[%s] Could not measure video duration, using default TTS rate", rid)
 
-        # Upload to GCS (off-thread; google-cloud-storage is blocking)
+            audio_path = await loop.run_in_executor(
+                None, _tts_step, rid, work_dir, req.audio_script, speaking_rate,
+            )
+
+            # ── Step 3: Merge ───────────────────────────────────────────
+            if audio_path:
+                t3 = time.time()
+                final_video = os.path.join(work_dir, "final.mp4")
+                merge_ok = await loop.run_in_executor(
+                    None, _merge_with_sync, silent_video, audio_path, final_video,
+                )
+                logger.info("[%s] FFmpeg merge: %.1fs (%s)", rid, time.time() - t3,
+                            "ok" if merge_ok else "failed")
+                if merge_ok:
+                    upload_path = final_video
+                    has_audio = True
+                else:
+                    logger.warning("[%s] Audio merge failed, uploading silent video", rid)
+
+        # ── Step 4: Upload to GCS ───────────────────────────────────────
         t4 = time.time()
         def _upload() -> str:
             client = storage.Client(project=os.getenv("GOOGLE_CLOUD_PROJECT"))

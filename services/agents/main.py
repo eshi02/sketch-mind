@@ -45,6 +45,7 @@ app = FastAPI(title="SketchMind Agents", lifespan=lifespan)
 AGENT_STAGES = {
     "scriptwriter": {"stage": "scripting", "message": "Writing video script..."},
     "manim_generator": {"stage": "coding", "message": "Generating animation code..."},
+    "narrator": {"stage": "narrating", "message": "Writing narration..."},
     "renderer": {"stage": "rendering", "message": "Rendering video..."},
     "manim_fixer": {"stage": "fixing", "message": "Fixing code, retrying render..."},
 }

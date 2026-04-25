@@ -1,9 +1,7 @@
 import asyncio
-import json
 import logging
 import os
 import pathlib
-import re
 from typing import AsyncGenerator
 
 from typing_extensions import override
@@ -23,59 +21,13 @@ PRO_MODEL = os.getenv("AGENT_PRO_MODEL", "gemini-3.1-pro-preview")
 FLASH_MODEL = os.getenv("AGENT_FLASH_MODEL", "gemini-3-flash-preview")
 
 
-_JSON_FENCE_RE = re.compile(r"^\s*```(?:json)?\s*(.*?)\s*```\s*$", re.DOTALL)
-
-
-def _extract_audio_script(script_raw) -> str:
-    """Pull `full_audio_script` out of the scriptwriter's SCRIPT_JSON state.
-
-    Tolerant of three forms the model commonly produces:
-      1. Already a dict (rare — usually a JSON-string)
-      2. Raw JSON string
-      3. Markdown-fenced JSON like ```json {...} ```
-    Returns "" on any extraction failure so the renderer falls back to a silent
-    video instead of crashing.
-    """
-    if not script_raw:
-        return ""
-    if isinstance(script_raw, dict):
-        return script_raw.get("full_audio_script", "") or ""
-
-    text = str(script_raw).strip()
-    fence_match = _JSON_FENCE_RE.match(text)
-    if fence_match:
-        text = fence_match.group(1).strip()
-
-    try:
-        parsed = json.loads(text)
-    except json.JSONDecodeError:
-        # Last resort: find the first {...} block in the string.
-        first_brace = text.find("{")
-        last_brace = text.rfind("}")
-        if first_brace != -1 and last_brace > first_brace:
-            try:
-                parsed = json.loads(text[first_brace : last_brace + 1])
-            except json.JSONDecodeError:
-                return ""
-        else:
-            return ""
-
-    if isinstance(parsed, dict):
-        return parsed.get("full_audio_script", "") or ""
-    return ""
-
-
 class RenderAgent(BaseAgent):
-    """Deterministic render step. Replaces the LLM-wrapped renderer agent.
+    """Deterministic render step.
 
-    Reads MANIM_CODE and SCRIPT_JSON from state, calls render_manim_video,
+    Reads MANIM_CODE and AUDIO_SCRIPT from state, calls render_manim_video,
     writes VIDEO_URL on success (and escalates the LoopAgent) or RENDER_ERROR
     on failure (and lets the LoopAgent move on to the fixer).
     """
-
-    @staticmethod
-    def _extract_audio_script(script_raw) -> str:
-        return _extract_audio_script(script_raw)
 
     @override
     async def _run_async_impl(
@@ -83,17 +35,10 @@ class RenderAgent(BaseAgent):
     ) -> AsyncGenerator[Event, None]:
         state = ctx.session.state
         manim_code = state.get("MANIM_CODE", "")
-        script_raw = state.get("SCRIPT_JSON", "")
+        audio_script = state.get("AUDIO_SCRIPT", "")
 
-        audio_script = self._extract_audio_script(script_raw)
         if not audio_script:
-            # Audio is critical for the educational format. Log loudly so we notice
-            # when scriptwriter output is malformed or missing the expected field.
-            logger.warning(
-                "[RenderAgent] No audio_script extracted — video will be silent. "
-                "SCRIPT_JSON head: %s",
-                str(script_raw)[:200] if script_raw else "(empty)",
-            )
+            logger.warning("[RenderAgent] AUDIO_SCRIPT is empty — video will be silent.")
 
         if not manim_code:
             state["RENDER_ERROR"] = "MANIM_CODE missing from session state"
@@ -179,59 +124,48 @@ async def create_agents():
         output_key="CURRICULUM_JSON",
     )
 
-    # 2. THE SCRIPTWRITER: Translates a single subtopic into a continuous timeline.
+    # 2. THE SCRIPTWRITER: Visual-only storyboard (narration is handled by the
+    #    narrator agent after the Manim code is generated).
     scriptwriter = Agent(
         name="scriptwriter",
         model=FLASH_MODEL,
-        description="Creates a precise, continuous Manim storyboard script from a subtopic brief.",
-        instruction="""You are a technical video scriptwriter and director for animated educational videos.
-    Translate the provided research brief into a visual-first storyboard.
+        description="Creates a precise, continuous Manim visual storyboard from a subtopic brief.",
+        instruction="""You are a technical video director for animated educational videos.
+    Translate the provided research brief into a detailed visual storyboard.
 
     Research Brief: {SUBTOPIC_DATA?}
 
-    Output ONLY a single JSON object representing the entire 60-90 second video.
+    Output ONLY a single JSON object representing a 90-120 second video.
 
     CRITICAL DESIGN PRINCIPLES:
     1. **ANIMATION-FIRST:** The video must be driven by moving shapes, graphs, arrows, transforms,
        and geometric objects — NOT walls of text. Text should only be short labels (1-5 words),
        titles, or key terms. NEVER display full sentences as on-screen text.
     2. **SHOW, DON'T TELL:** If explaining gravity, animate a ball falling — don't write "gravity
-       pulls objects down" on screen. The audio script carries the explanation; the visuals illustrate it.
+       pulls objects down" on screen.
     3. **MINIMAL ON-SCREEN TEXT:** Maximum 5 words per text element. Use at most 3 text elements
        visible at any time. Prefer MathTex for formulas and short Text labels for key terms.
-    4. **SAFE LAYOUT:** All elements must stay within the visible frame. Use coordinates within
-       x=[-6, 6] and y=[-3.5, 3.5]. Never place elements at extreme edges.
+    4. **SAFE LAYOUT:** All elements must stay within x=[-6, 6] and y=[-3.5, 3.5].
     5. **CLEAN TRANSITIONS:** FadeOut ALL previous elements before introducing new ones.
-       Never let elements pile up or overlap. Each visual section starts on a clean canvas.
     6. **KEEP VISUALS SIMPLE:** Use only basic shapes: circles, rectangles, arrows, lines, dots, axes.
-       Do NOT describe complex structures like molecular diagrams, circuit boards, DNA helices, or
-       detailed anatomical drawings. Instead, represent complex concepts using SIMPLE metaphors
-       with basic geometric shapes. For example: represent atoms as colored circles, bonds as lines,
-       data flow as arrows between boxes.
+       Represent complex concepts using SIMPLE metaphors with basic geometric shapes.
     7. **MAX 5 ELEMENTS:** Never have more than 5 visible elements on screen simultaneously.
 
     VISUAL DIRECTIVE RULES:
     1. One continuous flow — no separate scenes.
-    2. Chronological steps: "Step 1: ..., Step 2: ..., Step 3: ...".
+    2. Target 6-10 chronological steps for a rich, detailed animation.
     3. Use specific verbs: "Create", "Write", "Transform", "FadeIn", "FadeOut", "MoveAlongPath", "Indicate".
     4. Specify exact positions: "at UP*2+LEFT*3", "at center", "at DOWN*1.5".
     5. Specify object types: MathTex, Text (short labels only), Axes, Circle, Arrow, Line, Rectangle.
     6. Emphasize animated transitions: objects morphing, growing, moving, being highlighted.
     7. Each step MUST include FadeOut of previous elements if the area will be reused.
-
-    AUDIO SCRIPT RULES:
-    1. Write the full_audio_script as natural spoken narration — as if a teacher is explaining.
-    2. Do NOT include any special characters, markdown, asterisks, bullet points, or formatting.
-    3. Write plain conversational English only. No parentheses, no slashes, no technical markup.
-    4. Example GOOD: "Lets start with the Pythagorean theorem. It tells us that in a right triangle, the square of the longest side equals the sum of the squares of the other two sides."
-    5. Example BAD: "The *Pythagorean* theorem states: a² + b² = c² (where c = hypotenuse)."
+    8. Include "Wait 2 sec" after major animation moments to give viewers time to absorb.
+    9. End with "Wait 3 sec" for a clean outro.
 
     JSON SCHEMA:
     {
       "concept_title": "The title of the concept",
-      "full_audio_script": "Natural spoken narration without any special characters or formatting...",
-      "continuous_visual_directive": "Step 1: Write short Text 'Title' at UP*3. Wait 1 sec. Step 2: Create Circle at center. Step 3: FadeOut Text. Create Axes at center...",
-      "estimated_duration_seconds": 85
+      "continuous_visual_directive": "Step 1: Write short Text 'Title' at UP*3. Wait 2 sec. Step 2: Create Circle at center. Wait 2 sec. Step 3: FadeOut Text. Create Axes at center. Wait 2 sec. ..."
     }
 
     No markdown blocks around the JSON, no conversational text. ONLY raw JSON.
@@ -280,7 +214,8 @@ async def create_agents():
         At least 70% of the scene time should be geometric animations, not text appearing.
     11. **Graphs:** Use `axes.plot(func)` — verify with `lookup_manim_class("Axes")`.
     12. **Grouping:** Use `VGroup` for VMobjects of the same type, `Group` for mixed types.
-    13. **Pacing:** `self.wait(1)` after major animation blocks, `self.wait(2)` at scene end.
+    13. **Pacing:** `self.wait(2)` after every major animation block. `self.wait(3)` at scene end.
+        Target 5-8 distinct visual sections for a rich 90-120 second video.
     14. **No images or SVGs:** Do NOT use ImageMobject or SVGMobject.
 
     ANTI-PATTERN EXAMPLES (NEVER do these):
@@ -362,18 +297,53 @@ async def create_agents():
         output_key="MANIM_CODE",
     )
 
-    # Deterministic renderer step. Replaces the previous flash LLM wrapper which
-    # was both slow (100-450s of LLM thinking around a single tool call) and
-    # losing video URLs on success (exit_loop produced no output, so the
-    # function_response never reached the parent runner).
+    # 5. THE NARRATOR: Writes voiceover from the actual Manim code so narration
+    #    matches the visual sequence exactly.
+    narrator = Agent(
+        name="narrator",
+        model=FLASH_MODEL,
+        description="Writes narration synchronized to the actual Manim animation code.",
+        instruction="""You are a video narrator for educational animations.
+    You are given the actual Python animation code and the original concept brief.
+    Your job is to write narration that EXACTLY matches what appears on screen.
+
+    Animation Code:
+    {MANIM_CODE?}
+
+    Original Concept:
+    {SCRIPT_JSON?}
+
+    TIMING ANALYSIS — read the code and estimate timing:
+    - Each `self.play(...)` call takes approximately 1 second
+    - Each `self.wait(X)` call takes X seconds
+    - `self.play(FadeOut(*self.mobjects))` is a scene transition, approximately 1 second
+
+    RULES:
+    1. Walk through the code TOP TO BOTTOM. For each visual section
+       (between scene clears), write narration that explains what the viewer is seeing.
+    2. Match your word count to each section's duration.
+       At normal speaking pace, aim for approximately 2.5 words per second.
+       For example, a 10-second section needs about 25 words of narration.
+    3. Write plain conversational English. No special characters, no markdown,
+       no asterisks, no parentheses, no formatting of any kind.
+    4. The narration should TEACH the concept, not describe the code.
+       Say "Notice how the triangle forms" not "A triangle object is being created."
+    5. Use natural pauses by ending sentences where the code has self.wait() calls.
+    6. Keep the tone warm and educational, like a teacher explaining to a student.
+
+    Output ONLY the narration text as a single continuous paragraph.
+    No JSON, no markdown, no backticks, no explanation.
+    """,
+        output_key="AUDIO_SCRIPT",
+    )
+
+    # Deterministic renderer step.
     renderer_agent = RenderAgent(
         name="renderer",
         description="Renders Manim code into video and writes VIDEO_URL on success.",
     )
 
     # Loop: render → if error, fixer rewrites MANIM_CODE → re-render.
-    # max_iterations=3 paired with the stronger pro model — caps worst-case at ~12 min
-    # instead of ~25 min and avoids the long failed-cascade behavior seen in logs.
     render_and_fix_loop = LoopAgent(
         name="render_and_fix_loop",
         description="Renders Manim code and retries with fixer agent on errors.",
@@ -381,11 +351,11 @@ async def create_agents():
         max_iterations=3,
     )
 
-    # Subtopic pipeline: processes a single subtopic end-to-end.
+    # Subtopic pipeline: script → code → narration → render+fix.
     subtopic_pipeline = SequentialAgent(
         name="subtopic_pipeline",
-        description="Processes a single subtopic: script → code → render+fix.",
-        sub_agents=[scriptwriter, manim_generator, render_and_fix_loop],
+        description="Processes a single subtopic: script → code → narrate → render+fix.",
+        sub_agents=[scriptwriter, manim_generator, narrator, render_and_fix_loop],
     )
 
     return researcher, subtopic_pipeline, mcp_toolset
