@@ -36,7 +36,7 @@ services:
       GOOGLE_GENAI_USE_VERTEXAI: "True"
       GOOGLE_APPLICATION_CREDENTIALS: /gcp/creds.json
       AGENT_PRO_MODEL: ${AGENT_PRO_MODEL:-gemini-3.1-pro-preview}
-      AGENT_FLASH_MODEL: ${AGENT_FLASH_MODEL:-gemini-2.5-flash}
+      AGENT_FLASH_MODEL: ${AGENT_FLASH_MODEL:-gemini-3-flash-preview}
     volumes:
       - ${GOOGLE_APPLICATION_CREDENTIALS:-~/.config/gcloud/application_default_credentials.json}:/gcp/creds.json:ro
     depends_on:
