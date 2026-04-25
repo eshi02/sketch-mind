@@ -1,5 +1,6 @@
 """Cloud SQL PostgreSQL database layer with pgvector semantic cache."""
 
+import json
 import logging
 import os
 import uuid
@@ -95,6 +96,21 @@ async def init_db() -> None:
             );
             CREATE INDEX IF NOT EXISTS idx_search_history_user
             ON search_history (user_id, created_at DESC);
+        """)
+
+        # Learning paths: ordered list of topics, each generated as a video,
+        # gated sequentially in the UI (next unlocks when previous is marked done).
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS learning_paths (
+                id            TEXT PRIMARY KEY,
+                user_id       TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                title         TEXT NOT NULL,
+                topics        JSONB NOT NULL,
+                current_index INTEGER DEFAULT 0,
+                created_at    TIMESTAMPTZ DEFAULT now()
+            );
+            CREATE INDEX IF NOT EXISTS idx_learning_paths_user
+            ON learning_paths (user_id, created_at DESC);
         """)
 
 
@@ -422,3 +438,159 @@ async def clear_user_history(user_id: str) -> None:
         await conn.execute(
             "DELETE FROM search_history WHERE user_id = $1;", user_id,
         )
+
+
+# ---------------------------------------------------------------------------
+# Learning paths
+# ---------------------------------------------------------------------------
+
+async def create_learning_path(
+    path_id: str, user_id: str, title: str, topics: list[str],
+) -> dict:
+    """Create a new learning path with the given ordered topics."""
+    topics_data = [
+        {"topic": t, "session_id": None, "completed": False}
+        for t in topics
+    ]
+    async with pool.acquire() as conn:
+        await conn.execute(
+            """INSERT INTO learning_paths (id, user_id, title, topics, current_index)
+               VALUES ($1, $2, $3, $4::jsonb, 0);""",
+            path_id, user_id, title, json.dumps(topics_data),
+        )
+    return {
+        "id": path_id, "title": title, "topics": topics_data, "current_index": 0,
+    }
+
+
+async def get_user_paths(user_id: str) -> list[dict]:
+    """Return all learning paths for the user, newest first."""
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            """SELECT id, title, topics, current_index, created_at
+               FROM learning_paths
+               WHERE user_id = $1
+               ORDER BY created_at DESC;""",
+            user_id,
+        )
+        return [
+            {
+                "id": r["id"],
+                "title": r["title"],
+                "topics": json.loads(r["topics"]) if isinstance(r["topics"], str) else r["topics"],
+                "current_index": r["current_index"],
+                "created_at": r["created_at"].isoformat() if r["created_at"] else None,
+            }
+            for r in rows
+        ]
+
+
+async def get_learning_path(path_id: str, user_id: str) -> dict | None:
+    """Return a single learning path with attached video data per topic."""
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            """SELECT id, title, topics, current_index, created_at
+               FROM learning_paths
+               WHERE id = $1 AND user_id = $2;""",
+            path_id, user_id,
+        )
+        if not row:
+            return None
+
+        topics = json.loads(row["topics"]) if isinstance(row["topics"], str) else row["topics"]
+
+        # Attach video data for any topic that has a session_id.
+        for t in topics:
+            sid = t.get("session_id")
+            if not sid:
+                t["videos"] = []
+                continue
+            children = await conn.fetch(
+                """SELECT subtopic_title, video_url, subtopic_index
+                   FROM videos
+                   WHERE parent_id = $1 AND status = 'completed' AND video_url IS NOT NULL
+                   ORDER BY subtopic_index;""",
+                sid,
+            )
+            t["videos"] = [dict(c) for c in children]
+
+        return {
+            "id": row["id"],
+            "title": row["title"],
+            "topics": topics,
+            "current_index": row["current_index"],
+            "created_at": row["created_at"].isoformat() if row["created_at"] else None,
+        }
+
+
+async def attach_session_to_path_topic(
+    path_id: str, user_id: str, index: int, session_id: str,
+) -> bool:
+    """Set the session_id for a topic at a given index. Returns True on success."""
+    async with pool.acquire() as conn:
+        result = await conn.execute(
+            """UPDATE learning_paths
+               SET topics = jsonb_set(topics, ARRAY[$3::text, 'session_id'], to_jsonb($4::text))
+               WHERE id = $1 AND user_id = $2;""",
+            path_id, user_id, str(index), session_id,
+        )
+        return result == "UPDATE 1"
+
+
+async def mark_path_topic_completed(
+    path_id: str, user_id: str, index: int,
+) -> dict | None:
+    """Mark a topic as completed and advance current_index past consecutive done topics."""
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            "SELECT topics, current_index FROM learning_paths WHERE id = $1 AND user_id = $2;",
+            path_id, user_id,
+        )
+        if not row:
+            return None
+        topics = json.loads(row["topics"]) if isinstance(row["topics"], str) else row["topics"]
+        if index < 0 or index >= len(topics):
+            return None
+        topics[index]["completed"] = True
+
+        # Advance current_index past any consecutive completed topics from the start.
+        new_current = row["current_index"]
+        while new_current < len(topics) and topics[new_current].get("completed"):
+            new_current += 1
+
+        await conn.execute(
+            """UPDATE learning_paths
+               SET topics = $3::jsonb, current_index = $4
+               WHERE id = $1 AND user_id = $2;""",
+            path_id, user_id, json.dumps(topics), new_current,
+        )
+        return {"current_index": new_current, "topics": topics}
+
+
+async def delete_learning_path(path_id: str, user_id: str) -> bool:
+    """Delete a learning path. Returns True if deleted."""
+    async with pool.acquire() as conn:
+        result = await conn.execute(
+            "DELETE FROM learning_paths WHERE id = $1 AND user_id = $2;",
+            path_id, user_id,
+        )
+        return result == "DELETE 1"
+
+
+async def append_path_topic(path_id: str, user_id: str, topic: str) -> dict | None:
+    """Append a new topic to the end of a path. Returns updated topics list."""
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            "SELECT topics FROM learning_paths WHERE id = $1 AND user_id = $2;",
+            path_id, user_id,
+        )
+        if not row:
+            return None
+        topics = json.loads(row["topics"]) if isinstance(row["topics"], str) else row["topics"]
+        topics.append({"topic": topic, "session_id": None, "completed": False})
+        await conn.execute(
+            """UPDATE learning_paths SET topics = $3::jsonb
+               WHERE id = $1 AND user_id = $2;""",
+            path_id, user_id, json.dumps(topics),
+        )
+        return {"topics": topics}

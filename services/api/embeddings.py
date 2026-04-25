@@ -1,8 +1,10 @@
 """Generate text embeddings via Vertex AI for semantic caching."""
 
 import asyncio
+import json
 import logging
 import os
+import re
 
 from google.cloud import aiplatform
 
@@ -58,3 +60,40 @@ async def generate_embedding(text: str) -> list[float]:
     model = _get_embed_model()
     embeddings = await asyncio.to_thread(lambda: model.get_embeddings([text]))
     return embeddings[0].values
+
+
+async def generate_path_outline(title: str) -> list[str]:
+    """Break a high-level title into an ordered list of learning topics.
+
+    Used by the learning-path feature when the user provides only a title and
+    wants the AI to design a syllabus. Each returned item is a self-contained
+    sub-topic suitable for a single short video lesson.
+    """
+    model = _get_gen_model()
+    prompt = (
+        "Design a structured learning path for the topic below. "
+        "Break it into 5-8 ordered sub-topics that build on each other from "
+        "foundational to advanced. Each sub-topic must be a self-contained "
+        "lesson title (3-8 words) suitable for a 1-2 minute educational video. "
+        "Return ONLY a JSON array of strings, no markdown, no commentary.\n\n"
+        "Example for \"Calculus\":\n"
+        '["Limits and Continuity", "The Derivative", "Rules of Differentiation", '
+        '"Applications of Derivatives", "Integration Basics", "The Fundamental '
+        'Theorem of Calculus", "Techniques of Integration"]\n\n'
+        f'Topic: "{title}"'
+    )
+    response = await asyncio.to_thread(lambda: model.generate_content(prompt))
+    raw = response.text.strip()
+
+    # Strip code fences if the model added them despite the instruction.
+    raw = re.sub(r"^```(?:json)?\s*|\s*```$", "", raw, flags=re.MULTILINE).strip()
+
+    try:
+        topics = json.loads(raw)
+    except json.JSONDecodeError:
+        match = re.search(r"\[.*\]", raw, re.DOTALL)
+        topics = json.loads(match.group(0)) if match else []
+
+    cleaned = [str(t).strip() for t in topics if str(t).strip()]
+    logger.info("Path outline for %r: %d topics", title, len(cleaned))
+    return cleaned[:20]

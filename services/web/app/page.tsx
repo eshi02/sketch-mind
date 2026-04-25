@@ -615,6 +615,21 @@ export default function Home() {
         <div style={{ display: "flex", alignItems: "center", gap: "0.75rem" }}>
           {user ? (
             <>
+              <a
+                href="/paths"
+                style={{
+                  padding: "0.45rem 0.9rem",
+                  borderRadius: 8,
+                  border: "1px solid rgba(255,255,255,0.1)",
+                  background: "transparent",
+                  color: "#ccc",
+                  fontSize: "0.8rem",
+                  textDecoration: "none",
+                  transition: "all 0.2s",
+                }}
+              >
+                Paths
+              </a>
               <button
                 onClick={() => setShowHistory(!showHistory)}
                 style={{

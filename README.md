@@ -65,9 +65,12 @@ sketchmind/
 │   └── web/                   # Next.js frontend
 │       ├── Dockerfile
 │       ├── app/
-│       │   ├── page.tsx       # Main single-page app
+│       │   ├── page.tsx       # Home / topic search
 │       │   ├── auth-context.tsx # Auth state provider
-│       │   └── login/page.tsx # Google Sign-In page
+│       │   ├── login/page.tsx # Google Sign-In page
+│       │   └── paths/         # Learning paths (list + roadmap detail)
+│       │       ├── page.tsx
+│       │       └── [id]/page.tsx
 │       ├── next.config.js
 │       └── package.json
 ├── deploy.sh
@@ -134,6 +137,7 @@ The deploy script automatically:
 - **Google OAuth authentication** — sign in with Google to persist search history across sessions
 - **Search history** — view, replay, and manage past generations (individual delete + clear all)
 - **Background generation** — browse history while a video generates in the background, then restore the result
+- **Learning paths** — turn a high-level title (e.g. "Calculus Fundamentals") into an AI-designed syllabus of ordered sub-topics; progress is sequential (next unlocks when previous is marked complete), and the next topic is silently pre-fetched so it's ready to watch on demand
 - **Anonymous rate limiting** — 3 free generations for unauthenticated users, then sign-in required
 - **Example topics** — curated topic suggestions to help new users get started quickly
 - **Engaging loading UX** — pipeline progress indicator with rotating fun facts during generation
