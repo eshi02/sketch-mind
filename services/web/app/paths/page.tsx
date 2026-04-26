@@ -26,6 +26,11 @@ export default function PathsListPage() {
   const [title, setTitle] = useState("");
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [pendingDelete, setPendingDelete] = useState<{
+    id: string;
+    title: string;
+  } | null>(null);
+  const [deleting, setDeleting] = useState(false);
 
   const fetchPaths = useCallback(async () => {
     if (!token) return;
@@ -77,9 +82,10 @@ export default function PathsListPage() {
     }
   }
 
-  async function handleDelete(id: string) {
-    if (!token) return;
-    if (!confirm("Delete this learning path?")) return;
+  async function confirmDelete() {
+    if (!token || !pendingDelete) return;
+    const id = pendingDelete.id;
+    setDeleting(true);
     try {
       const res = await fetch(`${API_URL}/api/paths/${id}`, {
         method: "DELETE",
@@ -88,6 +94,9 @@ export default function PathsListPage() {
       if (res.ok) setPaths((prev) => prev.filter((p) => p.id !== id));
     } catch {
       /* ignore */
+    } finally {
+      setDeleting(false);
+      setPendingDelete(null);
     }
   }
 
@@ -116,6 +125,117 @@ export default function PathsListPage() {
         color: "#ededed",
       }}
     >
+      {/* Delete confirmation modal — replaces the browser-native confirm(). */}
+      {pendingDelete && (
+        <div
+          onClick={() => !deleting && setPendingDelete(null)}
+          style={{
+            position: "fixed",
+            inset: 0,
+            zIndex: 200,
+            background: "rgba(5,5,16,0.7)",
+            backdropFilter: "blur(8px)",
+            display: "flex",
+            alignItems: "center",
+            justifyContent: "center",
+            padding: "1rem",
+            cursor: deleting ? "not-allowed" : "pointer",
+          }}
+        >
+          <div
+            onClick={(e) => e.stopPropagation()}
+            style={{
+              cursor: "default",
+              width: "100%",
+              maxWidth: 440,
+              background: "linear-gradient(180deg, rgba(15,15,35,0.96) 0%, rgba(10,10,30,0.96) 100%)",
+              border: "1px solid rgba(239,68,68,0.3)",
+              borderRadius: 16,
+              padding: "1.5rem",
+              boxShadow: "0 20px 60px rgba(0,0,0,0.5), 0 0 30px rgba(239,68,68,0.12)",
+            }}
+          >
+            <div
+              style={{
+                fontSize: "0.7rem",
+                fontWeight: 700,
+                color: "#f87171",
+                textTransform: "uppercase",
+                letterSpacing: "0.08em",
+                marginBottom: "0.4rem",
+              }}
+            >
+              Delete learning path
+            </div>
+            <h3
+              style={{
+                margin: "0 0 0.4rem",
+                fontSize: "1.05rem",
+                fontWeight: 700,
+                color: "#ededed",
+              }}
+            >
+              {pendingDelete.title}
+            </h3>
+            <p
+              style={{
+                margin: "0 0 1.25rem",
+                fontSize: "0.88rem",
+                color: "#aaa",
+                lineHeight: 1.5,
+              }}
+            >
+              This permanently removes the path and your progress on it.
+            </p>
+            <div
+              style={{
+                display: "flex",
+                gap: "0.6rem",
+                justifyContent: "flex-end",
+              }}
+            >
+              <button
+                onClick={() => setPendingDelete(null)}
+                disabled={deleting}
+                style={{
+                  padding: "0.55rem 1.1rem",
+                  borderRadius: 10,
+                  border: "1px solid rgba(255,255,255,0.1)",
+                  background: "transparent",
+                  color: "#aaa",
+                  fontSize: "0.85rem",
+                  fontWeight: 500,
+                  cursor: deleting ? "not-allowed" : "pointer",
+                }}
+              >
+                Cancel
+              </button>
+              <button
+                onClick={confirmDelete}
+                disabled={deleting}
+                style={{
+                  padding: "0.55rem 1.25rem",
+                  borderRadius: 10,
+                  border: "none",
+                  background: deleting
+                    ? "rgba(239,68,68,0.4)"
+                    : "linear-gradient(135deg, #dc2626, #ef4444)",
+                  color: "#fff",
+                  fontSize: "0.85rem",
+                  fontWeight: 600,
+                  cursor: deleting ? "not-allowed" : "pointer",
+                  boxShadow: deleting
+                    ? "none"
+                    : "0 4px 14px rgba(239,68,68,0.35)",
+                }}
+              >
+                {deleting ? "Deleting..." : "Delete path"}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
       {/* Background orbs */}
       <div
         style={{
@@ -447,7 +567,7 @@ export default function PathsListPage() {
                     <button
                       onClick={(e) => {
                         e.stopPropagation();
-                        handleDelete(p.id);
+                        setPendingDelete({ id: p.id, title: p.title });
                       }}
                       style={{
                         padding: "0.3rem 0.6rem",
