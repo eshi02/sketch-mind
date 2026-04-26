@@ -144,8 +144,6 @@ The deploy script automatically:
 
 ---
 
-## Submission Notes
-
 ### Chosen vertical
 
 **EdTech / personalized visual learning.** Most online learning still hands students static text or pre-recorded video. SketchMind turns *any* topic — typed in plain English — into a custom animated lesson, plus an auto-graded quiz, plus a structured multi-topic learning path. The target user is a learner who wants a visual, paced explanation of something specific, on demand, without trawling YouTube.
