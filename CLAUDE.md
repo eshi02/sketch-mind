@@ -77,6 +77,40 @@ Docker Compose maps: db=5432, renderer=8082, agents=8081, api=8080, web=3000. Th
 
 Cloud SQL PostgreSQL 16 with pgvector. Schema auto-created on API startup via `database.py:init_db()`. Uses 768-dim embeddings for semantic caching. In production, Cloud Run connects via Unix socket (`--add-cloudsql-instances`). Locally, Docker Compose provides a pgvector container over TCP.
 
+## Learning Paths
+
+A user-authored ordered curriculum of sub-topics, each generated as a video. Defined in `services/api/main.py` (`/api/paths/...` endpoints), `services/api/database.py` (`learning_paths` table), and `services/web/app/paths/` (Next.js routes).
+
+**Storage:** `learning_paths` row holds `title`, an ordered JSONB `topics` array (`{topic, session_id, completed}` per item), `current_index`, and a `title_embedding vector(768)` for fuzzy lookups. Two relevant indexes: `(user_id, LOWER(title))` for exact dedupe, HNSW on `title_embedding` for fuzzy dedupe + cross-user reuse.
+
+**Dedupe + cache flow on `POST /api/paths`** (cheapest → most expensive, short-circuits on first hit):
+1. **L0 exact dedupe** — SQL `LOWER(title) =` for this user → return existing path. *0 LLM calls.*
+2. **L1 embed** — `generate_embedding(title)`. (`normalize_topic` is intentionally skipped here for credit savings; `text-embedding-004` is robust enough to phrasing variation that "Trigonometry" vs "explain the concept of trigonometry" still cluster above the 0.78 threshold.)
+3. **L2 fuzzy per-user dedupe** — pgvector cosine ≥ `SIMILARITY_THRESHOLD` (0.78), filtered by `user_id` → return existing path.
+4. **L3 cross-user syllabus cache** — same threshold, all users → reuse the existing `topics` titles list. Only consulted when the user did not provide explicit `topics`.
+5. **L4 fallback** — `generate_path_outline(title)` (one Gemini 2.5 Flash call) → produces a fresh syllabus.
+
+Per-topic video kick-off (`_kick_off_path_topic`) tries an **exact-text fast-path** against `videos` first (`find_completed_parent_by_topic`, partial index `idx_videos_lower_topic_completed_parents`) — zero LLM cost when two paths share a sub-topic title verbatim. Falls through to the existing `check_semantic_cache` on miss.
+
+**2-deep prefetch:** `POST /api/paths/{id}/start/{index}` kicks off the clicked topic and also fires `_prefetch_next_topic` for `index+1` and `index+2` in parallel — gives the second-next topic a full extra topic's worth of head-start so it's ready by the time the user advances. The submit endpoint additionally fires a backstop prefetch on a passing quiz. The session_id check inside `_kick_off_path_topic` is a no-op when a session already exists, so duplicate triggers don't double-spend; total generations per fully-completed N-topic path stay at N.
+
+**Startup backfill:** the API lifespan calls `backfill_path_embeddings(generate_embedding)` after `init_db()`, embedding any `learning_paths` row with `title_embedding IS NULL`. Idempotent — needed once after the embedding column was added so L2 can see legacy paths and collapse near-misses (typos like `"Trignometry"` vs `"Trigonometry"`).
+
+**Path-topic quizzes (gate completion):** each path topic has a 5-question MCQ quiz. Stored in `quizzes` table keyed by parent `session_id` — one Gemini call per unique session, shared across users. `GET /api/paths/{id}/quiz/{index}` lazy-generates and returns questions with `correct`/`explain` stripped via `_strip_answers`. `POST /api/paths/{id}/quiz/{index}/submit` grades server-side; on `score >= QUIZ_PASS_THRESHOLD` (0.8) it calls `mark_path_topic_completed`, unlocking the next topic. **The submit endpoint is the only path to topic completion** — no separate `/complete` endpoint exists, so the gate cannot be bypassed by direct API call.
+
+**Quiz UI in `services/web/app/paths/[id]/page.tsx`:**
+- Trigger button on each topic card (`Take Quiz to Unlock Next` for incomplete, `Retake Quiz` for completed) opens a fixed-position modal with a blurred backdrop (z-index 150). All quiz interaction happens inside that modal.
+- Per-option highlighting after grading **only marks the user's own pick** (green if correct, red if wrong). The actual correct option is never lit up, so the answer key cannot be inferred from a failed attempt.
+- Per-question explanations render only when `quizResult.passed` is true — wrong answers never reveal the explanation/answer.
+- `Take Again` / `Retry Quiz` uses `restartQuizAttempt` (soft reset of answers + result, keeping `quizQuestions`) so retakes don't refetch and the modal doesn't flicker.
+- Celebration overlay (z-index 200) with falling emoji confetti + spring-pop card fires on **any** pass (fresh unlock or retake), showing the actual percentage; auto-dismisses after 3.5s.
+
+**Important rules:**
+- A user cannot create two semantically-similar paths (L0/L2 enforce this). To force a parallel curriculum, use a different title.
+- `generate_path_outline` and `generate_quiz` are **not** ADK agents — both are single direct Gemini 2.5 Flash calls from the API service, sitting in `services/api/embeddings.py` next to `normalize_topic`. No changes to `services/agents/agent.py` for the path/quiz features.
+- L3 reuses topic *titles* only — never `session_id`s. Per-user progress (`current_index`, `completed`) stays isolated.
+- Quiz answers and explanations never leave the server before submission. After submission, the option-highlighting UI reveals only the user's pick, and explanations render only on a passing score.
+
 ## Key Implementation Notes
 
 - The API stores pipeline state in an in-memory `sessions` dict (not DB) for WebSocket polling. This means status is lost on API restart.

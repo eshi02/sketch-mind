@@ -27,7 +27,13 @@ from database import (
     add_search_history,
     append_path_topic,
     attach_session_to_path_topic,
+    backfill_path_embeddings,
+    check_path_outline_cache,
     check_semantic_cache,
+    find_completed_parent_by_topic,
+    get_quiz,
+    get_session_topic_and_subtopics,
+    save_quiz,
     clear_user_history,
     complete_parent_session,
     create_learning_path,
@@ -35,6 +41,8 @@ from database import (
     create_subtopic_record,
     delete_learning_path,
     delete_search_history,
+    find_user_path_by_embedding,
+    find_user_path_by_exact_title,
     get_all_videos,
     get_learning_path,
     get_user_history,
@@ -47,7 +55,12 @@ from database import (
     update_subtopic_record,
     upsert_google_user,
 )
-from embeddings import generate_embedding, generate_path_outline, normalize_topic
+from embeddings import (
+    generate_embedding,
+    generate_path_outline,
+    generate_quiz,
+    normalize_topic,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -83,6 +96,8 @@ def _auth_headers() -> dict:
 async def lifespan(_app: FastAPI):
     await init_db()
     await reconcile_stale_history()
+    # Embed any pre-existing learning_paths so L2 fuzzy dedupe can see them.
+    await backfill_path_embeddings(generate_embedding)
     yield
 
 
@@ -190,34 +205,67 @@ async def clear_history(request: Request):
 @app.post("/api/paths")
 async def create_path(req: CreatePathRequest, request: Request):
     """Create a new learning path. If `topics` is empty, the AI breaks the
-    title into a structured syllabus automatically."""
+    title into a structured syllabus automatically.
+
+    Layered to minimise LLM credits:
+      L0 exact-title dedupe (SQL)        → return existing
+      L1 embed once
+      L2 fuzzy per-user dedupe (pgvector) → return existing
+      L3 cross-user syllabus cache       → reuse topic list
+      L4 generate_path_outline (Gemini)  → fresh syllabus
+    """
     user = get_current_user(request)
     title = req.title.strip()
     if not title:
         raise HTTPException(status_code=400, detail="title is required")
 
+    # L0: exact-title dedupe, no LLM cost.
+    existing_id = await find_user_path_by_exact_title(user["sub"], title)
+    if existing_id:
+        existing = await get_learning_path(existing_id, user["sub"])
+        if existing:
+            logger.info("Path dedupe (L0 exact): user=%s → %s", user["sub"], existing_id)
+            return existing
+
     topics = [t.strip() for t in req.topics if t.strip()]
 
+    # L1: embed once. L2: fuzzy per-user dedupe.
+    embedding = await generate_embedding(title)
+    existing_id = await find_user_path_by_embedding(user["sub"], embedding)
+    if existing_id:
+        existing = await get_learning_path(existing_id, user["sub"])
+        if existing:
+            logger.info("Path dedupe (L2 fuzzy): user=%s → %s", user["sub"], existing_id)
+            return existing
+
     if not topics:
-        try:
-            topics = await generate_path_outline(title)
-        except Exception as exc:
-            logger.error("Path outline generation failed for %r: %s", title, exc)
-            raise HTTPException(
-                status_code=500,
-                detail="Could not generate topics for this title. Try adding topics manually.",
-            )
-        if not topics:
-            raise HTTPException(
-                status_code=500,
-                detail="AI returned no topics. Try a different title or add topics manually.",
-            )
+        # L3: reuse another user's syllabus before falling back to Gemini.
+        cached = await check_path_outline_cache(embedding)
+        if cached:
+            topics = cached
+            logger.info("Path syllabus reused from cache (L3) for %r", title)
+        else:
+            try:
+                topics = await generate_path_outline(title)
+            except Exception as exc:
+                logger.error("Path outline generation failed for %r: %s", title, exc)
+                raise HTTPException(
+                    status_code=500,
+                    detail="Could not generate topics for this title. Try adding topics manually.",
+                )
+            if not topics:
+                raise HTTPException(
+                    status_code=500,
+                    detail="AI returned no topics. Try a different title or add topics manually.",
+                )
 
     if len(topics) > 20:
         raise HTTPException(status_code=400, detail="A path can have at most 20 topics")
 
     path_id = generate_id()
-    return await create_learning_path(path_id, user["sub"], title, topics)
+    return await create_learning_path(
+        path_id, user["sub"], title, topics, embedding=embedding,
+    )
 
 
 @app.post("/api/paths/{path_id}/topics")
@@ -266,6 +314,20 @@ async def _kick_off_path_topic(
         return {"status": "existing", "session_id": topic_entry["session_id"]}
 
     topic = topic_entry["topic"]
+
+    # Fast-path: exact-text match against completed parents. Catches the common
+    # case where two users share a path topic title verbatim (the L3 syllabus
+    # cache copies titles unchanged), with zero LLM cost — no normalize, no
+    # embedding. Falls through to the existing semantic cache on miss.
+    exact_hit = await find_completed_parent_by_topic(topic)
+    if exact_hit:
+        await attach_session_to_path_topic(path_id, user_id, index, exact_hit["id"])
+        return {
+            "status": "cached",
+            "session_id": exact_hit["id"],
+            "videos": exact_hit["videos"],
+        }
+
     normalized = await normalize_topic(topic)
     embedding = await generate_embedding(normalized)
 
@@ -328,26 +390,20 @@ async def start_path_topic(path_id: str, index: int, request: Request):
         path_id, user["sub"], index, path["topics"][index],
     )
 
-    # Pre-fetch the next topic silently so it's likely ready when unlocked.
-    next_index = index + 1
-    if (
-        next_index < len(path["topics"])
-        and not path["topics"][next_index].get("session_id")
-    ):
-        asyncio.create_task(_prefetch_next_topic(
-            path_id, user["sub"], next_index, path["topics"][next_index],
-        ))
+    # 2-deep prefetch lookahead — N+1 and N+2 both kick off in parallel,
+    # so by the time the user advances twice the second-next topic has had
+    # plenty of head-start. Subsequent Starts re-trigger the same prefetch
+    # but the session_id check below is a no-op once a session exists.
+    for offset in (1, 2):
+        nx = index + offset
+        if (
+            nx < len(path["topics"])
+            and not path["topics"][nx].get("session_id")
+        ):
+            asyncio.create_task(_prefetch_next_topic(
+                path_id, user["sub"], nx, path["topics"][nx],
+            ))
 
-    return result
-
-
-@app.post("/api/paths/{path_id}/complete/{index}")
-async def complete_path_topic(path_id: str, index: int, request: Request):
-    """Mark a topic in the path as completed, unlocking the next one."""
-    user = get_current_user(request)
-    result = await mark_path_topic_completed(path_id, user["sub"], index)
-    if result is None:
-        raise HTTPException(status_code=404, detail="Path or topic not found")
     return result
 
 
@@ -359,6 +415,151 @@ async def delete_path(path_id: str, request: Request):
     if not deleted:
         raise HTTPException(status_code=404, detail="Path not found")
     return {"ok": True}
+
+
+# ---------------------------------------------------------------------------
+# Path-topic quizzes (gate completion at >= 80% score)
+# ---------------------------------------------------------------------------
+
+QUIZ_PASS_THRESHOLD = 0.8  # 4 of 5 by default
+
+
+def _strip_answers(questions: list[dict]) -> list[dict]:
+    """Strip `correct` and `explain` from a quiz before returning to the
+    client at fetch time, so the answer key never leaks pre-submission."""
+    return [
+        {"q": q["q"], "options": q["options"]}
+        for q in questions
+    ]
+
+
+async def _resolve_path_topic(
+    path_id: str, index: int, user_id: str,
+) -> tuple[dict, dict]:
+    """Verify the user owns the path and topic exists. Returns (path, topic)."""
+    path = await get_learning_path(path_id, user_id)
+    if not path:
+        raise HTTPException(status_code=404, detail="Path not found")
+    if index < 0 or index >= len(path["topics"]):
+        raise HTTPException(status_code=400, detail="Invalid topic index")
+    topic_entry = path["topics"][index]
+    if not topic_entry.get("session_id"):
+        raise HTTPException(
+            status_code=400,
+            detail="Topic has no videos yet — start the topic first.",
+        )
+    return path, topic_entry
+
+
+@app.get("/api/paths/{path_id}/quiz/{index}")
+async def get_path_topic_quiz(path_id: str, index: int, request: Request):
+    """Return the quiz for a path topic. Lazy-generates + caches per
+    session_id, so cross-user shares are free after the first generation."""
+    user = get_current_user(request)
+    _, topic_entry = await _resolve_path_topic(path_id, index, user["sub"])
+    session_id = topic_entry["session_id"]
+
+    questions = await get_quiz(session_id)
+    if questions is None:
+        ctx = await get_session_topic_and_subtopics(session_id)
+        if not ctx:
+            raise HTTPException(
+                status_code=404, detail="Video session context unavailable.",
+            )
+        try:
+            questions = await generate_quiz(ctx["topic"], ctx["subtopics"])
+        except Exception as exc:
+            logger.error(
+                "Quiz generation failed for session=%s: %s", session_id, exc,
+            )
+            raise HTTPException(
+                status_code=500,
+                detail="Could not generate the quiz. Try again in a moment.",
+            )
+        if not questions:
+            raise HTTPException(
+                status_code=500,
+                detail="Quiz generator returned no valid questions.",
+            )
+        await save_quiz(session_id, questions)
+
+    return {
+        "session_id": session_id,
+        "topic": topic_entry["topic"],
+        "questions": _strip_answers(questions),
+        "pass_threshold": QUIZ_PASS_THRESHOLD,
+    }
+
+
+class QuizSubmitRequest(BaseModel):
+    answers: list[int]
+
+
+@app.post("/api/paths/{path_id}/quiz/{index}/submit")
+async def submit_path_topic_quiz(
+    path_id: str, index: int, req: QuizSubmitRequest, request: Request,
+):
+    """Grade a quiz submission server-side. If score >= QUIZ_PASS_THRESHOLD,
+    also calls `mark_path_topic_completed` to mark the topic complete and
+    unlock the next one. This is the only path to topic completion."""
+    user = get_current_user(request)
+    _, topic_entry = await _resolve_path_topic(path_id, index, user["sub"])
+    session_id = topic_entry["session_id"]
+
+    questions = await get_quiz(session_id)
+    if questions is None:
+        raise HTTPException(
+            status_code=400,
+            detail="Fetch the quiz first before submitting.",
+        )
+    if len(req.answers) != len(questions):
+        raise HTTPException(
+            status_code=400,
+            detail=f"Expected {len(questions)} answers, got {len(req.answers)}.",
+        )
+
+    correct_count = 0
+    per_question = []
+    for q, a in zip(questions, req.answers):
+        is_correct = isinstance(a, int) and a == q["correct"]
+        if is_correct:
+            correct_count += 1
+        per_question.append({
+            "correct_index": q["correct"],
+            "user_index": a,
+            "is_correct": is_correct,
+            "explain": q.get("explain", ""),
+        })
+
+    score = correct_count / len(questions) if questions else 0.0
+    passed = score >= QUIZ_PASS_THRESHOLD
+
+    advanced = None
+    if passed:
+        advanced = await mark_path_topic_completed(path_id, user["sub"], index)
+        # Belt-and-braces lookahead: when a topic completes and the next
+        # one becomes "current", make sure the topic *after* it has its
+        # generation kicked off too. Skips no-op when already running.
+        if advanced:
+            after = advanced["current_index"] + 1
+            topics_now = advanced["topics"]
+            if (
+                after < len(topics_now)
+                and not topics_now[after].get("session_id")
+            ):
+                asyncio.create_task(_prefetch_next_topic(
+                    path_id, user["sub"], after, topics_now[after],
+                ))
+
+    return {
+        "score": score,
+        "correct_count": correct_count,
+        "total": len(questions),
+        "passed": passed,
+        "pass_threshold": QUIZ_PASS_THRESHOLD,
+        "per_question": per_question,
+        "current_index": advanced["current_index"] if advanced else None,
+    }
 
 
 # ---------------------------------------------------------------------------

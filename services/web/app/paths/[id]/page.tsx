@@ -94,6 +94,50 @@ export default function PathDetailPage({
   const [appending, setAppending] = useState(false);
   const wsRef = useRef<WebSocket | null>(null);
 
+  // Quiz state — keyed implicitly by activeIndex; one quiz visible at a time.
+  type QuizQuestion = { q: string; options: string[] };
+  type QuizPerQuestion = {
+    correct_index: number;
+    user_index: number | null;
+    is_correct: boolean;
+    explain: string;
+  };
+  type QuizResult = {
+    score: number;
+    correct_count: number;
+    total: number;
+    passed: boolean;
+    pass_threshold: number;
+    per_question: QuizPerQuestion[];
+    current_index: number | null;
+    // Captured at submit time so the banner can distinguish a fresh unlock
+    // from a retake on an already-completed topic.
+    was_review: boolean;
+  };
+  const [quizQuestions, setQuizQuestions] = useState<QuizQuestion[] | null>(null);
+  const [quizAnswers, setQuizAnswers] = useState<(number | null)[]>([]);
+  const [quizLoading, setQuizLoading] = useState(false);
+  const [quizSubmitting, setQuizSubmitting] = useState(false);
+  const [quizError, setQuizError] = useState<string | null>(null);
+  const [quizResult, setQuizResult] = useState<QuizResult | null>(null);
+  const [showCelebration, setShowCelebration] = useState(false);
+  const [quizModalOpen, setQuizModalOpen] = useState(false);
+
+  const resetQuizState = () => {
+    setQuizQuestions(null);
+    setQuizAnswers([]);
+    setQuizError(null);
+    setQuizResult(null);
+  };
+
+  // Soft reset for in-modal retakes — keeps the loaded questions so the
+  // modal stays open without a refetch flicker.
+  const restartQuizAttempt = () => {
+    setQuizAnswers(new Array(quizQuestions?.length ?? 0).fill(null));
+    setQuizError(null);
+    setQuizResult(null);
+  };
+
   const fetchPath = useCallback(async () => {
     if (!token) return;
     try {
@@ -235,25 +279,88 @@ export default function PathDetailPage({
     }
   }
 
-  async function handleComplete(index: number) {
+  // Reset quiz state when the user expands a different topic card.
+  useEffect(() => {
+    resetQuizState();
+    setQuizModalOpen(false);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [activeIndex]);
+
+  // Auto-dismiss the celebration overlay after a few seconds so the user
+  // can read the inline result banner without it lingering.
+  useEffect(() => {
+    if (!showCelebration) return;
+    const t = setTimeout(() => setShowCelebration(false), 3500);
+    return () => clearTimeout(t);
+  }, [showCelebration]);
+
+  async function handleLoadQuiz(index: number) {
     if (!token || !path) return;
+    setActiveIndex(index);
+    setQuizModalOpen(true);
+    // If we already have questions loaded for this topic (e.g. user closed
+    // and re-opened the modal without leaving the topic), skip refetch.
+    if (quizQuestions) return;
+    setQuizLoading(true);
+    setQuizError(null);
+    setQuizResult(null);
     try {
       const res = await fetch(
-        `${API_URL}/api/paths/${path.id}/complete/${index}`,
+        `${API_URL}/api/paths/${path.id}/quiz/${index}`,
+        { headers: { Authorization: `Bearer ${token}` } },
+      );
+      if (!res.ok) {
+        const data = await res.json().catch(() => ({}));
+        throw new Error(data.detail || "Failed to load quiz");
+      }
+      const data = await res.json();
+      setQuizQuestions(data.questions);
+      setQuizAnswers(new Array(data.questions.length).fill(null));
+    } catch (err) {
+      setQuizError(err instanceof Error ? err.message : "Failed to load quiz");
+    } finally {
+      setQuizLoading(false);
+    }
+  }
+
+  async function handleSubmitQuiz(index: number) {
+    if (!token || !path || !quizQuestions) return;
+    if (quizAnswers.some((a) => a === null)) {
+      setQuizError("Answer every question before submitting.");
+      return;
+    }
+    setQuizSubmitting(true);
+    setQuizError(null);
+    // Capture before fetchPath updates state — needed so the result banner
+    // can tell "fresh pass that just unlocked next" from "review of an
+    // already-completed topic".
+    const wasReview = !!path.topics[index]?.completed;
+    try {
+      const res = await fetch(
+        `${API_URL}/api/paths/${path.id}/quiz/${index}/submit`,
         {
           method: "POST",
-          headers: { Authorization: `Bearer ${token}` },
+          headers: {
+            "Content-Type": "application/json",
+            Authorization: `Bearer ${token}`,
+          },
+          body: JSON.stringify({ answers: quizAnswers }),
         },
       );
-      if (res.ok) {
-        await fetchPath();
-        setActiveIndex(null);
-        setLiveStage(null);
-        setLiveSubtopics([]);
-        setLiveTopicIndex(null);
+      if (!res.ok) {
+        const data = await res.json().catch(() => ({}));
+        throw new Error(data.detail || "Failed to submit quiz");
       }
-    } catch {
-      /* ignore */
+      const data = await res.json();
+      setQuizResult({ ...data, was_review: wasReview });
+      if (data.passed) {
+        setShowCelebration(true);
+        if (!wasReview) await fetchPath();
+      }
+    } catch (err) {
+      setQuizError(err instanceof Error ? err.message : "Failed to submit quiz");
+    } finally {
+      setQuizSubmitting(false);
     }
   }
 
@@ -303,6 +410,403 @@ export default function PathDetailPage({
         color: "#ededed",
       }}
     >
+      {/* Quiz modal — opens over a blurred backdrop so the questions get
+          full focus and the page scroll doesn't fight with the quiz. */}
+      {quizModalOpen && quizQuestions && activeIndex !== null && (() => {
+        const idx = activeIndex;
+        const topic = path.topics[idx];
+        const isReview = !!topic?.completed;
+        return (
+          <div
+            onClick={() => setQuizModalOpen(false)}
+            style={{
+              position: "fixed",
+              inset: 0,
+              zIndex: 150,
+              background: "rgba(5,5,16,0.65)",
+              backdropFilter: "blur(10px)",
+              display: "flex",
+              alignItems: "flex-start",
+              justifyContent: "center",
+              padding: "5vh 1rem",
+              overflowY: "auto",
+            }}
+          >
+            <div
+              onClick={(e) => e.stopPropagation()}
+              style={{
+                position: "relative",
+                width: "100%",
+                maxWidth: 720,
+                background: "linear-gradient(180deg, rgba(15,15,35,0.95) 0%, rgba(10,10,30,0.95) 100%)",
+                border: "1px solid rgba(79,70,229,0.3)",
+                borderRadius: 18,
+                padding: "1.75rem 1.75rem 1.5rem",
+                boxShadow: "0 20px 60px rgba(0,0,0,0.5), 0 0 30px rgba(79,70,229,0.15)",
+              }}
+            >
+              {/* Close button */}
+              <button
+                onClick={() => setQuizModalOpen(false)}
+                aria-label="Close quiz"
+                style={{
+                  position: "absolute",
+                  top: 14,
+                  right: 14,
+                  width: 32,
+                  height: 32,
+                  borderRadius: 8,
+                  border: "1px solid rgba(255,255,255,0.1)",
+                  background: "rgba(255,255,255,0.04)",
+                  color: "#aaa",
+                  fontSize: "1rem",
+                  cursor: "pointer",
+                  display: "flex",
+                  alignItems: "center",
+                  justifyContent: "center",
+                }}
+              >
+                ×
+              </button>
+
+              <div
+                style={{
+                  fontSize: "0.7rem",
+                  fontWeight: 700,
+                  color: "#a5b4fc",
+                  textTransform: "uppercase",
+                  letterSpacing: "0.08em",
+                  marginBottom: "0.35rem",
+                }}
+              >
+                {isReview ? "Practice quiz — review" : "Quiz — score 80% to unlock the next topic"}
+              </div>
+              <h3
+                style={{
+                  margin: "0 0 1.25rem",
+                  fontSize: "1.15rem",
+                  fontWeight: 700,
+                  color: "#ededed",
+                  paddingRight: "2rem",
+                }}
+              >
+                {topic?.topic}
+              </h3>
+
+              {quizQuestions.map((q, qi) => {
+                const result = quizResult?.per_question[qi];
+                return (
+                  <div key={qi} style={{ marginBottom: "1.1rem" }}>
+                    <div
+                      style={{
+                        fontSize: "0.92rem",
+                        fontWeight: 600,
+                        marginBottom: "0.55rem",
+                        color: "#ededed",
+                      }}
+                    >
+                      {qi + 1}. {q.q}
+                    </div>
+                    <div
+                      style={{
+                        display: "flex",
+                        flexDirection: "column",
+                        gap: "0.4rem",
+                      }}
+                    >
+                      {q.options.map((opt, oi) => {
+                        const selected = quizAnswers[qi] === oi;
+                        const userPickedCorrect =
+                          result &&
+                          result.user_index === oi &&
+                          result.is_correct;
+                        const userPickedWrong =
+                          result &&
+                          result.user_index === oi &&
+                          !result.is_correct;
+                        let bg = "rgba(255,255,255,0.04)";
+                        let border = "1px solid rgba(255,255,255,0.08)";
+                        let color = "#ddd";
+                        if (userPickedCorrect) {
+                          bg = "rgba(34,197,94,0.12)";
+                          border = "1px solid rgba(34,197,94,0.4)";
+                          color = "#4ade80";
+                        } else if (userPickedWrong) {
+                          bg = "rgba(239,68,68,0.1)";
+                          border = "1px solid rgba(239,68,68,0.35)";
+                          color = "#f87171";
+                        } else if (selected && !result) {
+                          bg = "rgba(79,70,229,0.15)";
+                          border = "1px solid rgba(79,70,229,0.45)";
+                          color = "#a5b4fc";
+                        }
+                        return (
+                          <button
+                            key={oi}
+                            onClick={() => {
+                              if (quizResult) return;
+                              setQuizAnswers((prev) => {
+                                const next = [...prev];
+                                next[qi] = oi;
+                                return next;
+                              });
+                            }}
+                            disabled={!!quizResult}
+                            style={{
+                              textAlign: "left",
+                              padding: "0.65rem 0.9rem",
+                              borderRadius: 8,
+                              border,
+                              background: bg,
+                              color,
+                              fontSize: "0.88rem",
+                              cursor: quizResult ? "default" : "pointer",
+                              transition: "all 0.15s",
+                            }}
+                          >
+                            {String.fromCharCode(65 + oi)}. {opt}
+                          </button>
+                        );
+                      })}
+                    </div>
+                    {quizResult?.passed && result && result.explain && (
+                      <div
+                        style={{
+                          marginTop: "0.55rem",
+                          padding: "0.55rem 0.75rem",
+                          borderRadius: 8,
+                          background: "rgba(79,70,229,0.08)",
+                          border: "1px solid rgba(79,70,229,0.18)",
+                          fontSize: "0.8rem",
+                          color: "#a5b4fc",
+                          lineHeight: 1.45,
+                        }}
+                      >
+                        {result.explain}
+                      </div>
+                    )}
+                  </div>
+                );
+              })}
+
+              {quizError && (
+                <p
+                  style={{
+                    color: "#f87171",
+                    fontSize: "0.82rem",
+                    background: "rgba(248,113,113,0.08)",
+                    border: "1px solid rgba(248,113,113,0.15)",
+                    borderRadius: 8,
+                    padding: "0.55rem 0.75rem",
+                    margin: "0.5rem 0",
+                  }}
+                >
+                  {quizError}
+                </p>
+              )}
+
+              {quizResult && (
+                <div
+                  style={{
+                    marginTop: "0.75rem",
+                    padding: "0.85rem 1rem",
+                    borderRadius: 10,
+                    background: quizResult.passed
+                      ? "rgba(34,197,94,0.12)"
+                      : "rgba(239,68,68,0.1)",
+                    border: `1px solid ${
+                      quizResult.passed
+                        ? "rgba(34,197,94,0.4)"
+                        : "rgba(239,68,68,0.35)"
+                    }`,
+                    color: quizResult.passed ? "#4ade80" : "#f87171",
+                    fontSize: "0.9rem",
+                    fontWeight: 600,
+                  }}
+                >
+                  Score: {quizResult.correct_count}/{quizResult.total} (
+                  {Math.round(quizResult.score * 100)}%) —{" "}
+                  {quizResult.was_review
+                    ? quizResult.passed
+                      ? "Passed (review)."
+                      : `Below ${Math.round(
+                          quizResult.pass_threshold * 100,
+                        )}% — topic stays completed.`
+                    : quizResult.passed
+                      ? "Passed! Next topic unlocked."
+                      : `Need ${Math.round(
+                          quizResult.pass_threshold * 100,
+                        )}% to pass. Try again.`}
+                </div>
+              )}
+
+              <div
+                style={{
+                  display: "flex",
+                  gap: "0.5rem",
+                  marginTop: "1rem",
+                  justifyContent: "flex-end",
+                }}
+              >
+                {!quizResult ? (
+                  <button
+                    onClick={() => handleSubmitQuiz(idx)}
+                    disabled={quizSubmitting}
+                    style={{
+                      padding: "0.65rem 1.5rem",
+                      borderRadius: 10,
+                      border: "none",
+                      background: quizSubmitting
+                        ? "rgba(79,70,229,0.3)"
+                        : "linear-gradient(135deg, #4f46e5, #7c3aed)",
+                      color: "#fff",
+                      fontSize: "0.88rem",
+                      fontWeight: 600,
+                      cursor: quizSubmitting ? "not-allowed" : "pointer",
+                      boxShadow: quizSubmitting
+                        ? "none"
+                        : "0 4px 14px rgba(79,70,229,0.35)",
+                    }}
+                  >
+                    {quizSubmitting ? "Grading..." : "Submit Quiz"}
+                  </button>
+                ) : (
+                  <button
+                    onClick={restartQuizAttempt}
+                    style={{
+                      padding: "0.65rem 1.5rem",
+                      borderRadius: 10,
+                      border: "1px solid rgba(79,70,229,0.4)",
+                      background: "rgba(79,70,229,0.1)",
+                      color: "#a5b4fc",
+                      fontSize: "0.88rem",
+                      fontWeight: 600,
+                      cursor: "pointer",
+                    }}
+                  >
+                    {quizResult.passed ? "Take Again" : "Retry Quiz"}
+                  </button>
+                )}
+                <button
+                  onClick={() => setQuizModalOpen(false)}
+                  style={{
+                    padding: "0.65rem 1.25rem",
+                    borderRadius: 10,
+                    border: "1px solid rgba(255,255,255,0.1)",
+                    background: "transparent",
+                    color: "#aaa",
+                    fontSize: "0.88rem",
+                    fontWeight: 500,
+                    cursor: "pointer",
+                  }}
+                >
+                  Close
+                </button>
+              </div>
+            </div>
+          </div>
+        );
+      })()}
+
+      {/* Celebration overlay — fires on any pass (fresh unlock or retake). */}
+      {showCelebration && (
+        <div
+          onClick={() => setShowCelebration(false)}
+          style={{
+            position: "fixed",
+            inset: 0,
+            zIndex: 200,
+            background: "rgba(5,5,16,0.55)",
+            backdropFilter: "blur(6px)",
+            display: "flex",
+            alignItems: "center",
+            justifyContent: "center",
+            cursor: "pointer",
+            animation: "celebrationFade 0.35s ease-out",
+          }}
+        >
+          {/* Falling confetti */}
+          {Array.from({ length: 24 }).map((_, ci) => {
+            const emoji = ["🎉", "✨", "🎊", "⭐", "💫"][ci % 5];
+            const left = (ci * 100) / 24 + Math.random() * 4;
+            const delay = Math.random() * 0.6;
+            const dur = 2 + Math.random() * 1.2;
+            const size = 1.2 + Math.random() * 1;
+            return (
+              <div
+                key={ci}
+                style={{
+                  position: "absolute",
+                  top: -40,
+                  left: `${left}%`,
+                  fontSize: `${size}rem`,
+                  animation: `confettiFall ${dur}s linear ${delay}s forwards`,
+                  pointerEvents: "none",
+                }}
+              >
+                {emoji}
+              </div>
+            );
+          })}
+
+          {/* Centerpiece card */}
+          <div
+            style={{
+              position: "relative",
+              padding: "2.25rem 2.75rem",
+              borderRadius: 24,
+              background:
+                "linear-gradient(135deg, rgba(34,197,94,0.18) 0%, rgba(79,70,229,0.18) 100%)",
+              border: "1px solid rgba(34,197,94,0.4)",
+              backdropFilter: "blur(20px)",
+              textAlign: "center",
+              animation:
+                "celebrationPop 0.6s cubic-bezier(0.34,1.56,0.64,1) forwards, celebrationGlow 1.8s ease-in-out 0.6s infinite",
+              maxWidth: 420,
+            }}
+          >
+            <div
+              style={{
+                fontSize: "3.5rem",
+                lineHeight: 1,
+                marginBottom: "0.75rem",
+                animation: "celebrationBounce 1.4s ease-in-out infinite",
+              }}
+            >
+              🎉
+            </div>
+            <h2
+              style={{
+                margin: 0,
+                fontSize: "1.6rem",
+                fontWeight: 800,
+                background:
+                  "linear-gradient(135deg, #4ade80 0%, #a5b4fc 100%)",
+                WebkitBackgroundClip: "text",
+                WebkitTextFillColor: "transparent",
+                letterSpacing: "-0.02em",
+              }}
+            >
+              {quizResult?.was_review ? "Quiz Passed!" : "Topic Complete!"}
+            </h2>
+            <p
+              style={{
+                margin: "0.6rem 0 0",
+                color: "#a5b4fc",
+                fontSize: "0.95rem",
+                fontWeight: 500,
+              }}
+            >
+              {quizResult
+                ? `You scored ${Math.round(quizResult.score * 100)}%${
+                    quizResult.was_review ? "" : " — next topic unlocked."
+                  }`
+                : "Quiz passed."}
+            </p>
+          </div>
+        </div>
+      )}
+
       {/* Background orbs */}
       <div
         style={{
@@ -751,29 +1255,42 @@ export default function PathDetailPage({
                         );
                       })()}
 
-                      {/* Mark-complete: only when this topic has a video. */}
-                      {!isCompleted &&
-                        ((activeTopic?.videos && activeTopic.videos.length > 0) ||
-                          (liveTopicIndex === i && liveStage === "completed")) && (
+                      {/* Trigger button — opens the quiz in a top-level modal. */}
+                      {((activeTopic?.videos && activeTopic.videos.length > 0) ||
+                        (liveTopicIndex === i && liveStage === "completed")) && (
+                        <div style={{ marginTop: "1.25rem" }}>
                           <button
-                            onClick={() => handleComplete(i)}
+                            onClick={() => handleLoadQuiz(i)}
+                            disabled={quizLoading && activeIndex === i}
                             style={{
-                              marginTop: "1rem",
                               padding: "0.65rem 1.25rem",
                               borderRadius: 10,
                               border: "none",
                               background:
-                                "linear-gradient(135deg, #16a34a, #22c55e)",
+                                quizLoading && activeIndex === i
+                                  ? "rgba(79,70,229,0.3)"
+                                  : "linear-gradient(135deg, #4f46e5, #7c3aed)",
                               color: "#fff",
                               fontSize: "0.85rem",
                               fontWeight: 600,
-                              cursor: "pointer",
-                              boxShadow: "0 4px 14px rgba(34,197,94,0.3)",
+                              cursor:
+                                quizLoading && activeIndex === i
+                                  ? "not-allowed"
+                                  : "pointer",
+                              boxShadow:
+                                quizLoading && activeIndex === i
+                                  ? "none"
+                                  : "0 4px 14px rgba(79,70,229,0.35)",
                             }}
                           >
-                            ✓ Mark as Complete &amp; Unlock Next
+                            {quizLoading && activeIndex === i
+                              ? "Loading quiz..."
+                              : isCompleted
+                                ? "Retake Quiz"
+                                : "Take Quiz to Unlock Next"}
                           </button>
-                        )}
+                        </div>
+                      )}
                     </div>
                   )}
                 </div>
@@ -928,6 +1445,27 @@ export default function PathDetailPage({
         @keyframes dotBounce {
           0%, 80%, 100% { opacity: 0.3; transform: scale(0.6); }
           40% { opacity: 1; transform: scale(1); }
+        }
+        @keyframes confettiFall {
+          0% { transform: translateY(0) rotate(0deg); opacity: 1; }
+          100% { transform: translateY(110vh) rotate(720deg); opacity: 0.8; }
+        }
+        @keyframes celebrationPop {
+          0% { transform: scale(0.4) rotate(-8deg); opacity: 0; }
+          60% { transform: scale(1.08) rotate(2deg); opacity: 1; }
+          100% { transform: scale(1) rotate(0deg); opacity: 1; }
+        }
+        @keyframes celebrationGlow {
+          0%, 100% { box-shadow: 0 0 30px rgba(34,197,94,0.35), 0 0 60px rgba(79,70,229,0.2); }
+          50% { box-shadow: 0 0 50px rgba(34,197,94,0.6), 0 0 100px rgba(79,70,229,0.4); }
+        }
+        @keyframes celebrationBounce {
+          0%, 100% { transform: translateY(0) scale(1); }
+          50% { transform: translateY(-10px) scale(1.08); }
+        }
+        @keyframes celebrationFade {
+          0% { opacity: 0; }
+          100% { opacity: 1; }
         }
         button:hover:not(:disabled) { filter: brightness(1.1); }
       `}</style>

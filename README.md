@@ -141,3 +141,34 @@ The deploy script automatically:
 - **Anonymous rate limiting** — 3 free generations for unauthenticated users, then sign-in required
 - **Example topics** — curated topic suggestions to help new users get started quickly
 - **Engaging loading UX** — pipeline progress indicator with rotating fun facts during generation
+
+---
+
+## Submission Notes
+
+### Chosen vertical
+
+**EdTech / personalized visual learning.** Most online learning still hands students static text or pre-recorded video. SketchMind turns *any* topic — typed in plain English — into a custom animated lesson, plus an auto-graded quiz, plus a structured multi-topic learning path. The target user is a learner who wants a visual, paced explanation of something specific, on demand, without trawling YouTube.
+
+### Approach and logic
+
+- **Multi-agent pipeline over monolith.** Each stage (research → script → Manim code → render+fix loop) is its own agent with a narrow job, which makes failures recoverable and prompts tight. The render+fix loop is the differentiator: Manim code that fails to compile is fed back to a fixer agent for up to 5 retries instead of failing the request.
+- **Manim, not stock footage / generic image gen.** Manim produces 3Blue1Brown-style animations — the right idiom for math, algorithms, and abstract concepts where motion explains the idea. We trade some flexibility for explanatory power.
+- **Semantic caching as a first-class architectural concern, not an afterthought.** Every paid step (embedding, Gemini call, render) is wrapped by a cache that gets cheaper as the system grows. Path creation in particular goes through 5 staged lookups (L0 SQL exact → L1 embed → L2 fuzzy per-user dedupe → L3 cross-user syllabus cache → L4 Gemini) so credits scale with *unique* topics, not with users.
+- **Quizzes gate progression, server-side.** Each path topic has 5 multiple-choice questions; the next topic only unlocks at ≥80%. Grading runs on the server, the answer key is stripped from the GET response, and the legacy "mark complete" endpoint was removed so the only path to completion is a passing quiz submission. No client-side bypass.
+- **Prefetch is staggered, not eager.** When a user starts topic N we kick off N+1 *and* N+2 in the background, with a backstop trigger on quiz pass. Total generations per fully-completed path stay at N (the session-id check no-ops duplicates), but the second-next topic gets ~10 minutes of head-start instead of ~5.
+
+### How the solution works
+
+End-to-end for a single topic (full diagram above):
+1. Frontend posts the topic to the API.
+2. API normalises + embeds the query, hits the semantic cache; on hit it returns videos in milliseconds.
+3. On miss, the agents service runs the research → script → Manim → render+fix chain, fanning out subtopics in parallel via `asyncio.gather`.
+4. The renderer service executes Manim Python in a sandboxed subprocess, uploads the MP4 to GCS, and returns a public URL.
+5. Status streams to the browser over a WebSocket throughout.
+
+For learning paths the same machinery is reused per-topic. Path creation runs the L0–L4 lookup chain to either reuse an existing syllabus, fuzzy-dedupe to the user's existing path, or generate a new one. Quiz state lives in its own table keyed by parent `session_id`, so a quiz is generated once and shared across every user who lands on the same topic.
+
+### Assumptions made
+
+- **Topics are educational, not adversarial.** Prompts rely on Gemini's default safety; we don't add a separate jailbreak layer.
