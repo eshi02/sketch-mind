@@ -1,7 +1,6 @@
 """SketchMind API gateway — FastAPI service that orchestrates video generation."""
 
 import asyncio
-import json
 import logging
 import os
 import warnings
@@ -30,12 +29,13 @@ from database import (
     backfill_path_embeddings,
     check_path_outline_cache,
     check_semantic_cache,
+    find_active_session_by_topic,
     find_completed_parent_by_topic,
     get_quiz,
+    get_session_status,
     get_session_topic_and_subtopics,
     save_quiz,
     clear_user_history,
-    complete_parent_session,
     create_learning_path,
     create_session,
     create_subtopic_record,
@@ -50,11 +50,11 @@ from database import (
     init_db,
     mark_failed,
     mark_path_topic_completed,
-    mark_subtopic_failed,
     reconcile_stale_history,
-    update_subtopic_record,
+    update_session_stage,
     upsert_google_user,
 )
+from cloud_tasks import enqueue_subtopic_task
 from embeddings import (
     generate_embedding,
     generate_path_outline,
@@ -65,9 +65,6 @@ from embeddings import (
 logger = logging.getLogger(__name__)
 
 AGENTS_URL = os.getenv("AGENTS_SERVICE_URL")
-
-# In-memory session state for WebSocket polling (lost on restart).
-sessions: dict[str, dict] = {}
 
 # ---------------------------------------------------------------------------
 # Service-to-service auth
@@ -337,16 +334,12 @@ async def _kick_off_path_topic(
         return {"status": "cached", "session_id": cached["id"], "videos": cached["videos"]}
 
     # Reuse in-flight session for the same topic if one is running.
-    for sid, state in sessions.items():
-        if (
-            state.get("topic", "").lower() == topic.strip().lower()
-            and state["stage"] not in ("completed", "failed")
-        ):
-            await attach_session_to_path_topic(path_id, user_id, index, sid)
-            return {"status": "processing", "session_id": sid}
+    in_flight = await find_active_session_by_topic(topic)
+    if in_flight:
+        await attach_session_to_path_topic(path_id, user_id, index, in_flight)
+        return {"status": "processing", "session_id": in_flight}
 
     video_id = await create_session(topic, embedding)
-    sessions[video_id] = {"stage": "starting", "topic": topic, "subtopics": []}
     await attach_session_to_path_topic(path_id, user_id, index, video_id)
 
     # Pass user_id=None so the pipeline does NOT write to search_history.
@@ -588,15 +581,11 @@ async def generate_video(req: TopicRequest, request: Request):
         }
 
     # Prevent duplicate in-flight generations for the same topic.
-    for sid, state in sessions.items():
-        if (
-            state.get("topic", "").lower() == req.topic.strip().lower()
-            and state["stage"] not in ("completed", "failed")
-        ):
-            return {"status": "processing", "session_id": sid}
+    in_flight = await find_active_session_by_topic(req.topic)
+    if in_flight:
+        return {"status": "processing", "session_id": in_flight}
 
     video_id = await create_session(req.topic, embedding)
-    sessions[video_id] = {"stage": "starting", "topic": req.topic, "subtopics": []}
 
     user_id = user["sub"] if user else None
     asyncio.create_task(run_pipeline(video_id, req.topic, user_id=user_id))
@@ -605,11 +594,16 @@ async def generate_video(req: TopicRequest, request: Request):
 
 @app.websocket("/ws/status/{session_id}")
 async def status_ws(ws: WebSocket, session_id: str):
-    """Stream generation status updates to the frontend."""
+    """Stream generation status updates to the frontend by polling the DB
+    (replaces the old in-memory `sessions` dict — survives API restarts and
+    works across multiple API instances)."""
     await ws.accept()
     try:
         while True:
-            state = sessions.get(session_id, {"stage": "unknown"})
+            state = await get_session_status(session_id)
+            if state is None:
+                await ws.send_json({"stage": "unknown"})
+                break
             await ws.send_json(state)
             if state["stage"] in ("completed", "failed"):
                 break
@@ -624,9 +618,16 @@ async def status_ws(ws: WebSocket, session_id: str):
 
 
 async def run_pipeline(video_id: str, topic: str, user_id: str | None = None) -> None:
-    """Phase 1: research subtopics. Phase 2: parallel subtopic processing."""
+    """Phase 1: research subtopics. Phase 2: enqueue subtopic tasks.
+
+    Each subtopic processing task is dispatched via Cloud Tasks (or direct HTTP
+    fallback). Per-subtopic stage updates are written to the DB by the agents
+    service. Parent finalization (status='completed'/'failed' + history write)
+    is performed by the agents endpoint when the last subtopic settles, since
+    this background coroutine returns as soon as enqueue finishes.
+    """
     try:
-        sessions[video_id]["stage"] = "researching"
+        await update_session_stage(video_id, "researching", "Researching subtopics...")
 
         async with httpx.AsyncClient(timeout=300, headers=_auth_headers()) as client:
             resp = await client.post(
@@ -637,105 +638,33 @@ async def run_pipeline(video_id: str, topic: str, user_id: str | None = None) ->
         if research_result.get("status") == "error" or not research_result.get("subtopics"):
             error = research_result.get("error", "No subtopics generated")
             await mark_failed(video_id, error)
-            sessions[video_id] = {"stage": "failed", "error": error, "subtopics": []}
             return
 
         subtopics = research_result["subtopics"]
 
-        subtopic_states = [
-            {
-                "subtopic_title": st.get("subtopic_title", f"Subtopic {i + 1}"),
-                "index": i,
-                "stage": "pending",
-                "message": "Waiting...",
-                "video_url": None,
-                "error": None,
-            }
-            for i, st in enumerate(subtopics)
-        ]
-        sessions[video_id] = {"stage": "generating", "subtopics": subtopic_states}
+        # Insert one child row per subtopic so the WebSocket sees the full
+        # ordered list immediately in `pending` state.
+        for i, st in enumerate(subtopics):
+            title = st.get("subtopic_title", f"Subtopic {i + 1}")
+            await create_subtopic_record(
+                parent_id=video_id, subtopic_title=title, subtopic_index=i,
+            )
 
-        tasks = [
-            _process_single_subtopic(video_id, st, i)
-            for i, st in enumerate(subtopics)
-        ]
-        await asyncio.gather(*tasks)
+        await update_session_stage(video_id, "generating", "Generating videos...")
 
-        await complete_parent_session(video_id)
-
-        final_subtopics = sessions[video_id]["subtopics"]
-        has_video = any(s.get("video_url") for s in final_subtopics)
-
-        # Write history BEFORE setting the completed stage so that when the
-        # WebSocket notifies the client and it fetches history, the record
-        # is already in the database.
-        if user_id and has_video:
-            h_id = generate_id()
-            await add_search_history(h_id, user_id, topic, video_id, status="completed")
-
-        sessions[video_id]["stage"] = "completed" if has_video else "failed"
-        if not has_video:
-            sessions[video_id]["error"] = "All subtopic videos failed"
+        # Enqueue each subtopic. Cloud Tasks dispatches them at the queue's
+        # configured concurrency (default 8); the agents service finalizes the
+        # parent when the last subtopic completes.
+        for i, st in enumerate(subtopics):
+            await enqueue_subtopic_task(
+                video_id=video_id,
+                subtopic_data={**st, "user_id": user_id, "topic": topic},
+                index=i,
+            )
 
     except Exception as exc:
+        logger.exception("run_pipeline failed for video_id=%s: %s", video_id, exc)
         await mark_failed(video_id, str(exc))
-        sessions[video_id] = {"stage": "failed", "error": str(exc), "subtopics": []}
-
-
-async def _process_single_subtopic(
-    video_id: str, subtopic_data: dict, index: int,
-) -> None:
-    """Stream NDJSON from agents /process-subtopic, updating sessions dict live."""
-    title = subtopic_data.get("subtopic_title", f"Subtopic {index + 1}")
-    child_id = await create_subtopic_record(
-        parent_id=video_id, subtopic_title=title, subtopic_index=index,
-    )
-
-    try:
-        timeouts = httpx.Timeout(connect=30, read=600, write=30, pool=60)
-        async with httpx.AsyncClient(timeout=timeouts, headers=_auth_headers()) as client:
-            async with client.stream(
-                "POST",
-                f"{AGENTS_URL}/process-subtopic",
-                json={"subtopic_data": subtopic_data, "index": index},
-            ) as resp:
-                async for line in resp.aiter_lines():
-                    if not line.strip():
-                        continue
-                    try:
-                        event = json.loads(line)
-                    except json.JSONDecodeError:
-                        continue
-
-                    st = sessions[video_id]["subtopics"][index]
-                    st["stage"] = event.get("stage", st["stage"])
-                    if "message" in event:
-                        st["message"] = event["message"]
-
-                    if event.get("stage") in ("completed", "failed"):
-                        st["video_url"] = event.get("video_url")
-                        st["error"] = event.get("error")
-
-                        if event.get("video_url"):
-                            await update_subtopic_record(child_id, event["video_url"])
-                        else:
-                            await mark_subtopic_failed(
-                                child_id, event.get("error", "No video"),
-                            )
-
-    except (httpx.ReadTimeout, httpx.ConnectTimeout, httpx.PoolTimeout) as exc:
-        error_msg = f"Timeout waiting for agents service: {type(exc).__name__}"
-        logger.error("Subtopic [%d] %r: %s", index, title, error_msg)
-        sessions[video_id]["subtopics"][index].update({
-            "stage": "failed", "message": error_msg, "error": error_msg,
-        })
-        await mark_subtopic_failed(child_id, error_msg)
-    except Exception as exc:
-        error_msg = str(exc)
-        sessions[video_id]["subtopics"][index].update({
-            "stage": "failed", "message": error_msg, "error": error_msg,
-        })
-        await mark_subtopic_failed(child_id, error_msg)
 
 
 # ---------------------------------------------------------------------------

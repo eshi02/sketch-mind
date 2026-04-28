@@ -1,7 +1,6 @@
 import asyncio
 import logging
 import os
-import pathlib
 from typing import AsyncGenerator
 
 from typing_extensions import override
@@ -10,8 +9,7 @@ from google.adk.agents import Agent, BaseAgent, SequentialAgent, LoopAgent
 from google.adk.agents.invocation_context import InvocationContext
 from google.adk.events import Event, EventActions
 from google.adk.tools.mcp_tool import McpToolset
-from google.adk.tools.mcp_tool.mcp_session_manager import StdioConnectionParams
-from mcp import StdioServerParameters
+from google.adk.tools.mcp_tool.mcp_session_manager import SseConnectionParams
 from tools.render_tool import render_manim_video
 
 logger = logging.getLogger("sketchmind-agents")
@@ -21,6 +19,9 @@ logger = logging.getLogger("sketchmind-agents")
 PRO_MODEL = os.getenv("AGENT_PRO_MODEL", "gemini-3.1-pro-preview")
 FLASH_MODEL = os.getenv("AGENT_FLASH_MODEL", "gemini-3-flash-preview")
 
+# MCP server URL — the standalone HTTP/SSE Manim API server.
+MCP_SERVER_URL = os.getenv("MCP_SERVER_URL", "http://localhost:9090")
+
 
 class RenderAgent(BaseAgent):
     """Deterministic render step.
@@ -28,6 +29,8 @@ class RenderAgent(BaseAgent):
     Reads MANIM_CODE and AUDIO_SCRIPT from state, calls render_manim_video,
     writes VIDEO_URL on success (and escalates the LoopAgent) or RENDER_ERROR
     on failure (and lets the LoopAgent move on to the fixer).
+
+    This is NOT an LLM agent — it calls a deterministic HTTP endpoint.
     """
 
     @override
@@ -60,7 +63,7 @@ class RenderAgent(BaseAgent):
             video_url = result["video_url"]
             state["VIDEO_URL"] = video_url
             state["RENDER_ERROR"] = ""
-            logger.info(f"[RenderAgent] success → {video_url}")
+            logger.info("[RenderAgent] success → %s", video_url)
             yield Event(
                 invocation_id=ctx.invocation_id,
                 author=self.name,
@@ -73,32 +76,30 @@ class RenderAgent(BaseAgent):
 
         # Failure path — surface the error for the fixer.
         err = result.get("error", "Unknown render error")
-        # Truncate so the fixer's prompt doesn't blow up token budget.
         err_short = err[-1500:] if len(err) > 1500 else err
         state["RENDER_ERROR"] = err_short
-        logger.info(f"[RenderAgent] failure → {err_short[:200]}")
+        logger.info("[RenderAgent] failure → %s", err_short[:200])
         yield Event(
             invocation_id=ctx.invocation_id,
             author=self.name,
             actions=EventActions(state_delta={"RENDER_ERROR": err_short}),
         )
 
-# Path to the MCP server script
-_MCP_SERVER_PATH = str(pathlib.Path(__file__).parent / "mcp_servers" / "manim_api_server.py")
-
 
 async def create_agents():
-    """Async factory that initializes MCP toolsets and builds the full agent graph.
+    """Async factory that connects to the MCP HTTP/SSE server and builds the
+    full agent graph.
 
     Returns (researcher, subtopic_pipeline, mcp_toolset).
     The mcp_toolset must be kept alive for the app lifetime and closed on shutdown.
+
+    Using SSE transport instead of stdio means multiple concurrent pipelines
+    can safely share the same MCP connection — each SSE session gets its own
+    read/write stream on the server side.
     """
     mcp_toolset = McpToolset(
-        connection_params=StdioConnectionParams(
-            server_params=StdioServerParameters(
-                command="python",
-                args=[_MCP_SERVER_PATH],
-            ),
+        connection_params=SseConnectionParams(
+            url=f"{MCP_SERVER_URL}/sse",
         ),
     )
     manim_tools = await mcp_toolset.get_tools()

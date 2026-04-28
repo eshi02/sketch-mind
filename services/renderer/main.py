@@ -226,45 +226,49 @@ async def render_video(req: RenderRequest):
     loop = asyncio.get_event_loop()
 
     try:
-        # ── Step 1: Render Manim video ──────────────────────────────────
-        silent_video, manim_err = await loop.run_in_executor(
+        # ── Step 1+2: Render Manim and synthesize TTS in parallel ────────
+        # Both are subprocess/API calls — they interleave on the event loop.
+        # The merge step handles any duration mismatch via setpts.
+        manim_future = loop.run_in_executor(
             None, _manim_step, rid, work_dir, req.python_code,
             req.scene_class_name, req.quality,
         )
+
+        tts_future = None
+        if req.audio_script:
+            tts_future = loop.run_in_executor(
+                None, _tts_step, rid, work_dir, req.audio_script, 0.95,
+            )
+
+        # Wait for both to complete
+        if tts_future:
+            (silent_video, manim_err), audio_path = await asyncio.gather(
+                manim_future, tts_future,
+            )
+        else:
+            silent_video, manim_err = await manim_future
+            audio_path = None
+
         if manim_err:
             return {"status": "error", "error": manim_err}
 
         upload_path = silent_video
         has_audio = False
 
-        # ── Step 2: TTS with rate matched to video duration ─────────────
-        if req.audio_script:
-            # Measure the rendered video's actual duration
-            video_dur = await loop.run_in_executor(None, _get_duration, silent_video)
-            if video_dur and video_dur > 0:
-                speaking_rate = _calc_speaking_rate(req.audio_script, video_dur)
-            else:
-                speaking_rate = 0.95  # fallback to default
-                logger.warning("[%s] Could not measure video duration, using default TTS rate", rid)
-
-            audio_path = await loop.run_in_executor(
-                None, _tts_step, rid, work_dir, req.audio_script, speaking_rate,
+        # ── Step 3: Merge (only if both video and audio succeeded) ──────
+        if audio_path:
+            t3 = time.time()
+            final_video = os.path.join(work_dir, "final.mp4")
+            merge_ok = await loop.run_in_executor(
+                None, _merge_with_sync, silent_video, audio_path, final_video,
             )
-
-            # ── Step 3: Merge ───────────────────────────────────────────
-            if audio_path:
-                t3 = time.time()
-                final_video = os.path.join(work_dir, "final.mp4")
-                merge_ok = await loop.run_in_executor(
-                    None, _merge_with_sync, silent_video, audio_path, final_video,
-                )
-                logger.info("[%s] FFmpeg merge: %.1fs (%s)", rid, time.time() - t3,
-                            "ok" if merge_ok else "failed")
-                if merge_ok:
-                    upload_path = final_video
-                    has_audio = True
-                else:
-                    logger.warning("[%s] Audio merge failed, uploading silent video", rid)
+            logger.info("[%s] FFmpeg merge: %.1fs (%s)", rid, time.time() - t3,
+                        "ok" if merge_ok else "failed")
+            if merge_ok:
+                upload_path = final_video
+                has_audio = True
+            else:
+                logger.warning("[%s] Audio merge failed, uploading silent video", rid)
 
         # ── Step 4: Upload to GCS ───────────────────────────────────────
         t4 = time.time()

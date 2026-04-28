@@ -9,13 +9,14 @@ warnings.filterwarnings("ignore", category=DeprecationWarning)
 warnings.filterwarnings("ignore", category=FutureWarning)
 
 from contextlib import asynccontextmanager
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 from google.adk.runners import Runner
 from google.adk.sessions import InMemorySessionService
 from google.genai import types
 from agent import create_agents
+from db import close_db, finalize_if_all_done, init_db, update_subtopic_stage
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("sketchmind-agents")
@@ -35,16 +36,21 @@ async def lifespan(app: FastAPI):
     every request reads agent + toolset from app.state. Saves the spawn cost on
     every call and keeps the lru_cache in manim_api_server.py warm across all
     subtopics that hit the same agents instance.
+
+    Also opens the DB pool used by /process-subtopic-task to write per-stage
+    progress that the API's WebSocket reads.
     """
     researcher, subtopic_pipeline, mcp_toolset = await create_agents()
     app.state.researcher = researcher
     app.state.subtopic_pipeline = subtopic_pipeline
     app.state.mcp_toolset = mcp_toolset
-    logger.info("Agents service warmed up: MCP toolset and agent graph ready")
+    await init_db()
+    logger.info("Agents service warmed up: MCP toolset, agent graph, DB pool ready")
     try:
         yield
     finally:
         await mcp_toolset.close()
+        await close_db()
 
 
 app = FastAPI(title="SketchMind Agents", lifespan=lifespan)
@@ -244,6 +250,162 @@ async def process_subtopic(req: SubtopicRequest):
             }) + "\n"
 
     return StreamingResponse(event_stream(), media_type="application/x-ndjson")
+
+
+# ---------------------------------------------------------------------------
+# POST /process-subtopic-task — Cloud Tasks target. Writes stage updates to DB.
+# ---------------------------------------------------------------------------
+
+class SubtopicTaskRequest(BaseModel):
+    video_id: str
+    subtopic_data: dict
+    index: int = 0
+
+
+@app.post("/process-subtopic-task")
+async def process_subtopic_task(req: SubtopicTaskRequest):
+    """Process one subtopic end-to-end. Writes per-stage progress to the
+    `videos` table (read by the API's WebSocket). On the last sibling to
+    settle, also finalizes the parent and writes search_history.
+
+    Returns 200 on success, 500 on internal error so Cloud Tasks retries.
+    """
+    title = req.subtopic_data.get("subtopic_title", f"Subtopic {req.index + 1}")
+    user_id = req.subtopic_data.get("user_id")
+    parent_topic = req.subtopic_data.get("topic", title)
+
+    logger.info(
+        "[task] video_id=%s index=%d title=%r start",
+        req.video_id, req.index, title,
+    )
+
+    try:
+        await update_subtopic_stage(
+            req.video_id, req.index, "starting", f"Processing: {title}",
+        )
+
+        subtopic_pipeline = app.state.subtopic_pipeline
+        session_service = InMemorySessionService()
+        runner = Runner(
+            agent=subtopic_pipeline,
+            app_name="sketchmind",
+            session_service=session_service,
+        )
+        session = await session_service.create_session(
+            app_name="sketchmind", user_id="user",
+        )
+        # Drop user_id/topic before handing to the agent — they're our metadata,
+        # not part of the subtopic prompt.
+        agent_subtopic_data = {
+            k: v for k, v in req.subtopic_data.items()
+            if k not in ("user_id", "topic")
+        }
+        session.state["SUBTOPIC_DATA"] = json.dumps(agent_subtopic_data)
+
+        final_text = ""
+        video_url = None
+        last_stage = None
+        stage_start = time.time()
+        pipeline_start = stage_start
+
+        async for event in runner.run_async(
+            user_id="user",
+            session_id=session.id,
+            new_message=types.Content(
+                role="user",
+                parts=[types.Part.from_text(
+                    text=f"Create an educational video about: {title}"
+                )],
+            ),
+        ):
+            author = getattr(event, "author", "")
+            if author in AGENT_STAGES and author != last_stage:
+                now = time.time()
+                if last_stage:
+                    logger.info(
+                        "[task] video_id=%s index=%d stage=%s took %.1fs",
+                        req.video_id, req.index, last_stage, now - stage_start,
+                    )
+                stage_start = now
+                last_stage = author
+                stage_info = AGENT_STAGES[author]
+                await update_subtopic_stage(
+                    req.video_id, req.index,
+                    stage_info["stage"], stage_info["message"],
+                )
+
+            if hasattr(event, "content") and event.content:
+                for part in (event.content.parts or []):
+                    if hasattr(part, "text") and part.text:
+                        final_text = part.text
+                    if hasattr(part, "function_response") and part.function_response:
+                        resp = part.function_response.response
+                        if isinstance(resp, dict) and resp.get("video_url"):
+                            video_url = resp["video_url"]
+
+        if not video_url:
+            state = (await session_service.get_session(
+                app_name="sketchmind", user_id="user", session_id=session.id,
+            )).state
+            direct = state.get("VIDEO_URL")
+            if direct:
+                video_url = str(direct)
+            if not video_url:
+                for key in ["RENDER_ERROR", "RENDER_RESULT"]:
+                    val = state.get(key, "")
+                    if val:
+                        video_url = _extract_video_url(str(val))
+                        if video_url:
+                            break
+            if not video_url and final_text:
+                video_url = _extract_video_url(final_text)
+
+        if last_stage:
+            logger.info(
+                "[task] video_id=%s index=%d stage=%s took %.1fs",
+                req.video_id, req.index, last_stage, time.time() - stage_start,
+            )
+        logger.info(
+            "[task] video_id=%s index=%d total=%.1fs %s",
+            req.video_id, req.index, time.time() - pipeline_start,
+            "success" if video_url else "failed",
+        )
+
+        if video_url:
+            await update_subtopic_stage(
+                req.video_id, req.index,
+                "completed", "Video ready", video_url=video_url,
+            )
+        else:
+            await update_subtopic_stage(
+                req.video_id, req.index,
+                "failed", "No video produced", error="No video produced",
+            )
+
+        await finalize_if_all_done(req.video_id, user_id, parent_topic)
+
+        return {
+            "status": "ok",
+            "video_url": video_url,
+            "index": req.index,
+        }
+
+    except Exception as exc:
+        logger.exception(
+            "[task] video_id=%s index=%d failed: %s",
+            req.video_id, req.index, exc,
+        )
+        # Persist failure so the WebSocket sees it, then 500 so Cloud Tasks
+        # retries up to max_attempts; the final failed UPDATE will stick.
+        try:
+            await update_subtopic_stage(
+                req.video_id, req.index,
+                "failed", "Processing failed", error=str(exc),
+            )
+            await finalize_if_all_done(req.video_id, user_id, parent_topic)
+        except Exception:
+            logger.exception("Failed to record subtopic failure")
+        raise HTTPException(status_code=500, detail=str(exc))
 
 
 @app.get("/health")

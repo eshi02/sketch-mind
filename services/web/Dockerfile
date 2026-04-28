@@ -1,13 +1,17 @@
 FROM node:20-slim AS builder
 WORKDIR /app
-ARG NEXT_PUBLIC_API_URL=http://localhost:8080
-ARG GOOGLE_CLIENT_ID=
-ENV NEXT_PUBLIC_API_URL=$NEXT_PUBLIC_API_URL
-ENV GOOGLE_CLIENT_ID=$GOOGLE_CLIENT_ID
 COPY package*.json ./
 RUN npm install
 COPY . .
-RUN npm run build
+ARG NEXT_PUBLIC_API_URL
+ARG NEXT_PUBLIC_GOOGLE_CLIENT_ID
+RUN if [ -n "$NEXT_PUBLIC_API_URL" ]; then \
+      echo "NEXT_PUBLIC_API_URL=$NEXT_PUBLIC_API_URL" >> .env.production; \
+    fi && \
+    if [ -n "$NEXT_PUBLIC_GOOGLE_CLIENT_ID" ]; then \
+      echo "NEXT_PUBLIC_GOOGLE_CLIENT_ID=$NEXT_PUBLIC_GOOGLE_CLIENT_ID" >> .env.production; \
+    fi && \
+    npm run build
 
 FROM node:20-slim
 WORKDIR /app

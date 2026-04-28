@@ -170,32 +170,57 @@ export default function PathDetailPage({
 
   function pollStatus(sessionId: string) {
     if (wsRef.current) wsRef.current.close();
-    const wsUrl = API_URL.replace(/^http/, "ws") + `/ws/status/${sessionId}`;
-    const ws = new WebSocket(wsUrl);
-    wsRef.current = ws;
+    let retries = 0;
+    let done = false;
+    const MAX_RETRIES = 5;
 
-    ws.onmessage = (event) => {
-      const state: WsState = JSON.parse(event.data);
-      // "unknown" = in-memory session gone (server restart or pre-fetch
-      // long since finished). Videos may be in DB — refetch and stop polling.
-      if (state.stage === "unknown") {
+    function connect() {
+      const wsUrl = API_URL.replace(/^http/, "ws") + `/ws/status/${sessionId}`;
+      const ws = new WebSocket(wsUrl);
+      wsRef.current = ws;
+
+      ws.onmessage = (event) => {
+        retries = 0;
+        const state: WsState = JSON.parse(event.data);
+        if (state.stage === "unknown") {
+          done = true;
+          ws.close();
+          wsRef.current = null;
+          setLiveStage(null);
+          setLiveTopicIndex(null);
+          fetchPath();
+          return;
+        }
+        setLiveStage(state.stage);
+        if (state.subtopics?.length) setLiveSubtopics([...state.subtopics]);
+        if (state.error) setLiveError(state.error);
+        if (state.stage === "completed" || state.stage === "failed") {
+          done = true;
+          ws.close();
+          wsRef.current = null;
+          fetchPath();
+        }
+      };
+
+      ws.onclose = () => {
+        if (done) return;
+        if (wsRef.current !== ws) return;
+        if (retries < MAX_RETRIES) {
+          const delay = Math.min(1000 * 2 ** retries, 8000);
+          retries++;
+          setTimeout(connect, delay);
+        } else {
+          setLiveError("Connection lost — please refresh");
+          wsRef.current = null;
+        }
+      };
+
+      ws.onerror = () => {
         ws.close();
-        wsRef.current = null;
-        setLiveStage(null);
-        setLiveTopicIndex(null);
-        fetchPath();
-        return;
-      }
-      setLiveStage(state.stage);
-      if (state.subtopics?.length) setLiveSubtopics([...state.subtopics]);
-      if (state.error) setLiveError(state.error);
-      if (state.stage === "completed" || state.stage === "failed") {
-        ws.close();
-        wsRef.current = null;
-        fetchPath();
-      }
-    };
-    ws.onerror = () => setLiveError("Connection failed");
+      };
+    }
+
+    connect();
   }
 
   async function handleStart(index: number) {
@@ -1145,7 +1170,7 @@ export default function PathDetailPage({
                           fontStyle: "italic",
                         }}
                       >
-                        Complete previous topic to unlock
+                      Complete previous topic to unlock
                       </span>
                     )}
                   </div>
@@ -1153,15 +1178,121 @@ export default function PathDetailPage({
                   {/* Active topic content (live generation or completed videos) */}
                   {isActiveCard && (
                     <div style={{ marginTop: "1.25rem" }}>
-                      {/* Live spinner: only on the actively-generating card
-                          when no DB videos exist yet. */}
+                      {/* Per-subtopic progress tracker — shows each subtopic's
+                          current stage so the user understands what's still
+                          in progress and why the quiz isn't available yet. */}
+                      {liveTopicIndex === i &&
+                        liveSubtopics.length > 0 &&
+                        !isCompleted &&
+                        !(activeTopic?.videos && activeTopic.videos.length > 0) && (
+                          <div style={{ display: "flex", flexDirection: "column", gap: "0.5rem", marginBottom: "1rem" }}>
+                            {liveSubtopics.map((sub) => {
+                              const isDone = sub.stage === "completed" && sub.video_url;
+                              const isFailed = sub.stage === "failed";
+                              const isPending = sub.stage === "pending";
+                              const isProcessing = !isDone && !isFailed && !isPending;
+                              return (
+                                <div
+                                  key={sub.index}
+                                  style={{
+                                    display: "flex",
+                                    alignItems: "center",
+                                    gap: "0.7rem",
+                                    padding: "0.6rem 0.85rem",
+                                    borderRadius: 10,
+                                    background: isDone
+                                      ? "rgba(34,197,94,0.08)"
+                                      : isFailed
+                                        ? "rgba(248,113,113,0.08)"
+                                        : isProcessing
+                                          ? "rgba(79,70,229,0.08)"
+                                          : "rgba(255,255,255,0.02)",
+                                    border: `1px solid ${
+                                      isDone
+                                        ? "rgba(34,197,94,0.25)"
+                                        : isFailed
+                                          ? "rgba(248,113,113,0.2)"
+                                          : isProcessing
+                                            ? "rgba(79,70,229,0.2)"
+                                            : "rgba(255,255,255,0.06)"
+                                    }`,
+                                  }}
+                                >
+                                  {/* Status icon */}
+                                  {isDone ? (
+                                    <span style={{ color: "#4ade80", fontSize: "1rem", flexShrink: 0 }}>✓</span>
+                                  ) : isFailed ? (
+                                    <span style={{ color: "#f87171", fontSize: "1rem", flexShrink: 0 }}>✗</span>
+                                  ) : isProcessing ? (
+                                    <Spinner size={16} />
+                                  ) : (
+                                    <span style={{ color: "#555", fontSize: "0.85rem", flexShrink: 0 }}>○</span>
+                                  )}
+
+                                  {/* Title + stage */}
+                                  <div style={{ flex: 1, minWidth: 0 }}>
+                                    <div style={{
+                                      fontSize: "0.82rem",
+                                      fontWeight: 600,
+                                      color: isDone ? "#4ade80" : isFailed ? "#f87171" : isProcessing ? "#a5b4fc" : "#666",
+                                      whiteSpace: "nowrap",
+                                      overflow: "hidden",
+                                      textOverflow: "ellipsis",
+                                    }}>
+                                      {sub.subtopic_title}
+                                    </div>
+                                    {isProcessing && (
+                                      <div style={{
+                                        fontSize: "0.72rem",
+                                        color: "#818cf8",
+                                        marginTop: 2,
+                                      }}>
+                                        {STAGE_LABELS[sub.stage] || sub.stage}
+                                      </div>
+                                    )}
+                                    {isFailed && sub.error && (
+                                      <div style={{
+                                        fontSize: "0.72rem",
+                                        color: "#f87171",
+                                        marginTop: 2,
+                                        opacity: 0.8,
+                                      }}>
+                                        Failed
+                                      </div>
+                                    )}
+                                  </div>
+                                </div>
+                              );
+                            })}
+
+                            {/* Overall progress summary */}
+                            {(() => {
+                              const done = liveSubtopics.filter((s) => s.stage === "completed" && s.video_url).length;
+                              const total = liveSubtopics.length;
+                              const allDone = done === total;
+                              return (
+                                <div style={{
+                                  fontSize: "0.75rem",
+                                  color: allDone ? "#4ade80" : "#818cf8",
+                                  textAlign: "center",
+                                  marginTop: "0.25rem",
+                                  fontWeight: 500,
+                                }}>
+                                  {done}/{total} videos ready{!allDone && " — quiz unlocks when all complete"}
+                                </div>
+                              );
+                            })()}
+                          </div>
+                        )}
+
+                      {/* Fallback spinner when no subtopics arrived yet */}
                       {liveTopicIndex === i &&
                         !isCompleted &&
                         liveStage &&
                         liveStage !== "completed" &&
                         liveStage !== "failed" &&
                         liveStage !== "unknown" &&
-                        liveVideos.length === 0 &&
+                        liveSubtopics.length === 0 &&
                         (!activeTopic?.videos ||
                           activeTopic.videos.length === 0) && (
                           <div
@@ -1198,7 +1329,7 @@ export default function PathDetailPage({
                         </p>
                       )}
 
-                      {/* Prefer DB-backed videos; fall back to live stream. */}
+                      {/* Completed videos from DB or live stream */}
                       {(() => {
                         const videosToShow =
                           activeTopic?.videos && activeTopic.videos.length > 0

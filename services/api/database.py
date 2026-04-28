@@ -64,15 +64,23 @@ async def init_db() -> None:
             WITH (m = 16, ef_construction = 64);
         """)
 
-        # Parent-child multi-video columns (added via ALTER for backwards compat)
+        # Parent-child multi-video columns (added via ALTER for backwards compat).
+        # `stage` and `message` carry the queue-pipeline progress that the
+        # WebSocket reads — replaces the old in-memory `sessions` dict.
         for col, typedef in [
             ("subtopic_title", "TEXT"),
             ("parent_id", "TEXT"),
             ("subtopic_index", "INTEGER"),
+            ("stage", "TEXT"),
+            ("message", "TEXT"),
         ]:
             await conn.execute(
                 f"ALTER TABLE videos ADD COLUMN IF NOT EXISTS {col} {typedef};"
             )
+        await conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_videos_parent_index "
+            "ON videos (parent_id, subtopic_index) WHERE parent_id IS NOT NULL;"
+        )
 
         await conn.execute("""
             CREATE TABLE IF NOT EXISTS users (
@@ -309,8 +317,8 @@ async def create_session(topic: str, embedding: list[float]) -> str:
     async with pool.acquire() as conn:
         await conn.execute(
             """
-            INSERT INTO videos (id, topic, embedding, status)
-            VALUES ($1, $2, $3::vector, 'processing');
+            INSERT INTO videos (id, topic, embedding, status, stage, message)
+            VALUES ($1, $2, $3::vector, 'processing', 'starting', 'Starting...');
             """,
             video_id, topic, str(embedding),
         )
@@ -325,8 +333,11 @@ async def create_subtopic_record(
     async with pool.acquire() as conn:
         await conn.execute(
             """
-            INSERT INTO videos (id, topic, status, parent_id, subtopic_title, subtopic_index)
-            VALUES ($1, $2, 'processing', $3, $4, $5);
+            INSERT INTO videos
+              (id, topic, status, stage, message,
+               parent_id, subtopic_title, subtopic_index)
+            VALUES ($1, $2, 'processing', 'pending', 'Waiting...',
+                    $3, $4, $5);
             """,
             child_id, subtopic_title, parent_id, subtopic_title, subtopic_index,
         )
@@ -374,9 +385,103 @@ async def mark_failed(video_id: str, error: str) -> None:
     """Mark a video as failed with the error message."""
     async with pool.acquire() as conn:
         await conn.execute(
-            "UPDATE videos SET status = 'failed', error = $1 WHERE id = $2;",
+            "UPDATE videos SET status = 'failed', error = $1, stage = 'failed' WHERE id = $2;",
             error[:2000], video_id,
         )
+
+
+async def update_session_stage(
+    session_id: str, stage: str, message: str | None = None,
+) -> None:
+    """Update the parent session's stage (starting/researching/generating/completed/failed)."""
+    async with pool.acquire() as conn:
+        await conn.execute(
+            "UPDATE videos SET stage = $1, message = COALESCE($2, message) "
+            "WHERE id = $3 AND parent_id IS NULL;",
+            stage, message, session_id,
+        )
+
+
+async def update_subtopic_stage(
+    parent_id: str, index: int,
+    stage: str, message: str | None = None,
+    video_url: str | None = None, error: str | None = None,
+) -> None:
+    """Update a child subtopic row by (parent_id, index). Sets terminal `status`
+    + `video_url` / `error` columns when stage is 'completed' or 'failed' so the
+    existing semantic-cache and history queries keep working."""
+    fields = ["stage = $3", "message = COALESCE($4, message)"]
+    params: list = [parent_id, index, stage, message]
+    if stage == "completed" and video_url:
+        fields += ["status = 'completed'", f"video_url = ${len(params)+1}"]
+        params.append(video_url)
+    elif stage == "failed":
+        fields += ["status = 'failed'"]
+        if error:
+            fields.append(f"error = ${len(params)+1}")
+            params.append(error[:2000])
+    sql = (
+        "UPDATE videos SET " + ", ".join(fields) +
+        " WHERE parent_id = $1 AND subtopic_index = $2;"
+    )
+    async with pool.acquire() as conn:
+        await conn.execute(sql, *params)
+
+
+async def get_session_status(session_id: str) -> dict | None:
+    """Return the WebSocket-shaped status payload for a session: parent stage +
+    full ordered subtopic list. Replaces the in-memory `sessions` dict."""
+    async with pool.acquire() as conn:
+        parent = await conn.fetchrow(
+            "SELECT id, topic, status, stage, message, error "
+            "FROM videos WHERE id = $1 AND parent_id IS NULL;",
+            session_id,
+        )
+        if not parent:
+            return None
+        children = await conn.fetch(
+            "SELECT subtopic_index, subtopic_title, stage, message, "
+            "       video_url, status, error "
+            "FROM videos WHERE parent_id = $1 ORDER BY subtopic_index;",
+            session_id,
+        )
+
+        if parent["status"] in ("completed", "failed"):
+            stage = parent["status"]
+        else:
+            stage = parent["stage"] or "starting"
+
+        return {
+            "stage": stage,
+            "topic": parent["topic"],
+            "error": parent["error"],
+            "subtopics": [
+                {
+                    "index": c["subtopic_index"],
+                    "subtopic_title": c["subtopic_title"],
+                    "stage": c["stage"] or "pending",
+                    "message": c["message"] or "Waiting...",
+                    "video_url": c["video_url"],
+                    "error": c["error"],
+                }
+                for c in children
+            ],
+        }
+
+
+async def find_active_session_by_topic(topic: str) -> str | None:
+    """Look up any in-flight parent session whose topic matches (case-insensitive).
+    Used to dedupe duplicate /api/generate calls for the same topic across users."""
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            "SELECT id FROM videos "
+            "WHERE parent_id IS NULL "
+            "  AND status = 'processing' "
+            "  AND LOWER(topic) = LOWER($1) "
+            "ORDER BY created_at DESC LIMIT 1;",
+            topic.strip(),
+        )
+        return row["id"] if row else None
 
 
 async def get_all_videos() -> list[dict]:

@@ -90,13 +90,12 @@ const PIPELINE_STEPS = [
 ];
 
 const EXAMPLE_TOPICS = [
-  "Explain the concept of recursion in programming",
-  "How binary search algorithm works step by step",
-  "The Pythagorean theorem explained visually",
-  "How integration works in calculus",
-  "Trigonometry: sine, cosine and unit circle",
-  "How sorting algorithms compare: bubble vs quick sort",
-  "Explain Big O notation with examples",
+  "Linear Algebra",
+  "Binary Search",
+  "Calculus",
+  "Bubble Sort Vs Quick Sort",
+  "Probability and Statistics",
+  "Recursion in programming",
 ];
 
 // ---------------------------------------------------------------------------
@@ -451,43 +450,65 @@ export default function Home() {
   }
 
   function pollStatus(sessionId: string) {
-    const wsUrl = API_URL.replace(/^http/, "ws") + `/ws/status/${sessionId}`;
-    const ws = new WebSocket(wsUrl);
+    let retries = 0;
+    let done = false;
+    const MAX_RETRIES = 5;
 
-    ws.onmessage = (event) => {
-      const state: WsState = JSON.parse(event.data);
+    function connect() {
+      const wsUrl = API_URL.replace(/^http/, "ws") + `/ws/status/${sessionId}`;
+      const ws = new WebSocket(wsUrl);
 
-      if (bgGen.current) {
-        bgGen.current.status = state.stage;
-        if (state.subtopics?.length) bgGen.current.subtopics = [...state.subtopics];
-        if (state.error) bgGen.current.error = state.error;
-      }
+      ws.onmessage = (event) => {
+        retries = 0; // reset on successful message
+        const state: WsState = JSON.parse(event.data);
 
-      if (!viewingHistoryRef.current) {
-        setStatus(state.stage);
-        if (state.subtopics?.length) setSubtopics([...state.subtopics]);
-      }
+        if (bgGen.current) {
+          bgGen.current.status = state.stage;
+          if (state.subtopics?.length) bgGen.current.subtopics = [...state.subtopics];
+          if (state.error) bgGen.current.error = state.error;
+        }
 
-      if (state.stage === "completed") {
-        setLoading(false);
-        ws.close();
-        fetchHistory();
-        if (viewingHistoryRef.current) restoreGeneration();
-        bgGen.current = null;
-      } else if (state.stage === "failed") {
-        if (!viewingHistoryRef.current) setError(state.error || "Generation failed");
-        setLoading(false);
-        ws.close();
-        bgGen.current = null;
-        fetchHistory();
-      }
-    };
+        if (!viewingHistoryRef.current) {
+          setStatus(state.stage);
+          if (state.subtopics?.length) setSubtopics([...state.subtopics]);
+        }
 
-    ws.onerror = () => {
-      if (!viewingHistoryRef.current) setError("WebSocket connection failed");
-      setLoading(false);
-      bgGen.current = null;
-    };
+        if (state.stage === "completed") {
+          done = true;
+          setLoading(false);
+          ws.close();
+          fetchHistory();
+          if (viewingHistoryRef.current) restoreGeneration();
+          bgGen.current = null;
+        } else if (state.stage === "failed") {
+          done = true;
+          if (!viewingHistoryRef.current) setError(state.error || "Generation failed");
+          setLoading(false);
+          ws.close();
+          bgGen.current = null;
+          fetchHistory();
+        }
+      };
+
+      ws.onclose = () => {
+        if (done) return; // terminal state received — don't reconnect
+        if (retries < MAX_RETRIES) {
+          const delay = Math.min(1000 * 2 ** retries, 8000);
+          retries++;
+          setTimeout(connect, delay);
+        } else {
+          if (!viewingHistoryRef.current) setError("Connection lost — please refresh");
+          setLoading(false);
+          bgGen.current = null;
+        }
+      };
+
+      ws.onerror = () => {
+        ws.close(); // triggers onclose → reconnect
+      };
+    }
+
+    connect();
   }
 
   // --- Navigation helpers ---
